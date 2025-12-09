@@ -1,6 +1,12 @@
 """
 FiLM (Feature-wise Linear Modulation)
 Applies γ(h) ⊙ f + β(h) transformation
+
+Version: WP0.1-FiLM-v1.0
+Last Modified: 2025-12-09
+Changelog:
+  v1.0 (2025-12-09): Initial implementation with spatial/vector support
+Dependencies: torch>=2.0
 """
 
 import torch
