@@ -30,3 +30,9 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Documents
+docs/
+
+# Results
+results/
