@@ -23,14 +23,16 @@ import torch.nn as nn
 from typing import Tuple, List, Optional
 import logging
 
-# W0.1 Level 0: Configuration
-from configs.mnist_config import MNIST_CONFIG
-
-# W0.1 Level 1: Conditioning components
-from models.conditioning.conditioning_networks import MNISTConditioner
-
-# W0.1 Level 2: Coupling layers
-from models.flows.coupling_layers import ConditionalAffineCoupling
+try:
+    # W0.1 Level 0: Configuration
+    from configs.mnist_config import MNIST_CONFIG
+    # W0.1 Level 1: Conditioning components
+    from csmf.conditioning.conditioning_networks import MNISTConditioner
+    # W0.1 Level 2: Coupling layers
+    from csmf.flows.coupling_layers import ConditionalAffineCoupling
+except ImportError as e:
+    logging.error(f"Failed to import dependencies: {e}")
+    raise
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -105,6 +107,7 @@ class ScaleBlock(nn.Module):
         # Flatten for coupling layers
         z_flat = z.reshape(B, -1)
         
+        '''
         if not reverse:
             # Forward: apply coupling layers then squeeze
             for i, layer in enumerate(self.coupling_layers):
@@ -133,6 +136,29 @@ class ScaleBlock(nn.Module):
                 log_det = log_det + ld
             
             z_out = z_flat.reshape(B, C, H, W)
+        '''
+        
+        
+        ############## ERROR 3: test_realnvp_invertibility ######################
+        if not reverse:
+            # Forward: coupling → squeeze
+            for coupling in self.coupling_layers:
+                z_flat, ld = coupling.forward(z_flat, h, reverse=False)
+            z_out = z_flat.reshape(B, C, H, W)
+            if self.apply_squeeze:
+                z_out = self._squeeze(z_out)
+        else:
+            # Inverse: unsqueeze FIRST → coupling
+            z_out = z_flat.reshape(B, C, H, W)
+            if self.apply_squeeze:
+                z_out = self._unsqueeze(z_out)  # Expand spatial dims FIRST
+            
+            z_flat = z_out.reshape(B, -1)  # Re-flatten for coupling
+            for coupling in reversed(self.coupling_layers):
+                z_flat, ld = coupling.forward(z_flat, h, reverse=True)
+            z_out = z_flat.reshape(B, C*4, H*2, W*2)  # or appropriate shape
+            
+        ############################################################################
         
         return z_out, log_det
     

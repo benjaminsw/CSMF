@@ -29,8 +29,8 @@ import math
 
 try:
     from configs.mnist_config import MNIST_CONFIG
-    from models.conditioning.conditioning_networks import MNISTConditioner
-    from models.conditioning.film import FiLM
+    from csmf.conditioning.conditioning_networks import MNISTConditioner
+    from csmf.conditioning.film import FiLM
 except ImportError as e:
     logging.error(f"Failed to import dependencies: {e}")
     raise

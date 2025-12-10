@@ -409,6 +409,14 @@ class ConditionalAffineCoupling(nn.Module):
         # Apply FiLM: out = gamma * features + beta
         out = gamma * features + beta
         
+        ############################# DEBUGGING ###############################
+        print(f"h norm: {torch.norm(h).item()}")
+        print(f"gamma range: [{gamma.min().item()}, {gamma.max().item()}]")
+        print(f"beta range: [{beta.min().item()}, {beta.max().item()}]")
+        print(f"feature norm before: {torch.norm(features).item()}")
+        print(f"feature norm after: {torch.norm(gamma * features + beta).item()}")
+        ######################################################################
+        
         return out
 
 
