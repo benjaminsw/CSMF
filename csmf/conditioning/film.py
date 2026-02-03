@@ -1,10 +1,11 @@
 """
 FiLM (Feature-wise Linear Modulation)
-Applies γ(h) ⊙ f + β(h) transformation
+Applies γ(h) ⊙ f + β(h) transformation with LayerNorm and identity initialization
 
-Version: WP0.1-FiLM-v1.0
-Last Modified: 2025-12-09
+Version: WP0.1-FiLM-v1.1
+Last Modified: 2025-02-03
 Changelog:
+  v1.1 (2025-02-03): Added LayerNorm for h normalization, identity initialization (gamma=1+δ, beta=δ), configurable scale_factor
   v1.0 (2025-12-09): Initial implementation with spatial/vector support
 Dependencies: torch>=2.0
 """
@@ -36,19 +37,31 @@ class MLP(nn.Module):
 
 class FiLM(nn.Module):
     """
-    Feature-wise Linear Modulation
+    Feature-wise Linear Modulation with LayerNorm and identity initialization
     
     Args:
-        h_dim: Dimension of conditioning features h
         f_dim: Dimension of features to modulate f
+        h_dim: Dimension of conditioning features h
         hidden_dims: List of hidden layer dimensions for MLPs
+        scale_factor: Scale for modulation parameters (default=0.1)
+                     Controls strength of conditioning at initialization
+        use_layer_norm: Whether to normalize h before MLPs (default=True)
     """
     
-    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128]):
+    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=0.1, use_layer_norm=True):
         super().__init__()
+        
+        # Set seed for reproducibility
+        torch.manual_seed(2026)
         
         self.h_dim = h_dim
         self.f_dim = f_dim
+        self.scale_factor = scale_factor
+        self.use_layer_norm = use_layer_norm
+        
+        # LayerNorm for conditioning features
+        if self.use_layer_norm:
+            self.layer_norm = nn.LayerNorm(h_dim)
         
         # Separate MLPs for gamma (scale) and beta (shift)
         self.gamma_mlp = MLP(h_dim, f_dim, hidden_dims)
@@ -56,7 +69,7 @@ class FiLM(nn.Module):
     
     def forward(self, f, h):
         """
-        Apply FiLM transformation: γ(h) ⊙ f + β(h)
+        Apply FiLM transformation: (1 + scale*γ_mlp(h)) ⊙ f + scale*β_mlp(h)
         
         Args:
             f: Features to modulate [B, f_dim] or [B, f_dim, H, W]
@@ -69,9 +82,13 @@ class FiLM(nn.Module):
         if h.dim() == 4:  # [B, h_dim, H, W]
             h = torch.mean(h, dim=[2, 3])  # Global average pooling → [B, h_dim]
         
-        # Compute modulation parameters
-        gamma = self.gamma_mlp(h)  # [B, f_dim]
-        beta = self.beta_mlp(h)    # [B, f_dim]
+        # Normalize conditioning features
+        if self.use_layer_norm:
+            h = self.layer_norm(h)
+        
+        # Compute modulation parameters with identity initialization
+        gamma = 1.0 + self.scale_factor * self.gamma_mlp(h)  # [B, f_dim], starts at 1
+        beta = self.scale_factor * self.beta_mlp(h)          # [B, f_dim], starts at 0
         
         # Handle spatial features to modulate
         if f.dim() == 4:  # [B, f_dim, H, W]
