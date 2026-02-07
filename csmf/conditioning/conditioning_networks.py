@@ -10,6 +10,7 @@ Changelog:
 Dependencies: torch>=2.0
 """
 
+from venv import logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,8 +29,9 @@ class MNISTConditioner(nn.Module):
                        If False, use stride-2 convs (better performance, default)
     """
     
-    def __init__(self, in_channels=1, h_dim=64, config=None, spec_compliant=False):
+    def __init__(self, in_channels=1, h_dim=64, config=None, spec_compliant=False, debug=False):
         super().__init__()
+        self.debug = debug
         
         self.h_dim = h_dim
         self.spec_compliant = spec_compliant
@@ -111,6 +113,11 @@ class MNISTConditioner(nn.Module):
             If spec_compliant=True: h [B, h_dim] (flattened)
             If spec_compliant=False: h [B, h_dim, H', W'] (spatial, default [B, h_dim, 4, 4])
         """
+        
+        # ADD HERE - Start
+        if self.debug:
+            logger.debug(f"[CONDITIONER] Input y: shape={y.shape}, norm={torch.norm(y).item():.4f}")
+
         if self.spec_compliant:
             # WP0 spec path: explicit pooling + flatten
             h = F.relu(self.bn1(self.conv1(y)))
@@ -119,8 +126,18 @@ class MNISTConditioner(nn.Module):
             h = F.max_pool2d(h, 2)  # 14→7
             h = h.flatten(1)  # [B, 64*7*7]
             h = self.fc(h)  # [B, h_dim]
+            
+            # ADD HERE - Before return (spec path)
+            if self.debug:
+                logger.debug(f"[CONDITIONER] Output h (spec): shape={h.shape}, norm={torch.norm(h).item():.4f}")
+            
             return h
         else:
             # Performance path: stride-2 convs (spatial output)
             h = self.encoder(y)
+            
+            # ADD HERE - Before return (performance path)
+            if self.debug:
+                logger.debug(f"[CONDITIONER] Output h (spatial): shape={h.shape}, norm={torch.norm(h).item():.4f}")
+            
             return h

@@ -143,67 +143,72 @@ def create_masks(
 
 class BatchNormFlow(nn.Module):
     """
-    Batch normalization as an invertible flow layer.
-    
-    Applies: y = (x - μ) / σ * γ + β
-    Log-det: log|det(J)| = sum(log|γ/σ|)
-    
-    From Dinh et al. (2017) Real NVP paper.
+    Invertible BatchNorm flow layer.
+    Uses batch stats in training and caches them for exact inverse.
+    Uses running stats in eval.
     """
-    
+
     def __init__(self, dim: int, momentum: float = 0.1, eps: float = 1e-5):
         super().__init__()
         self.dim = dim
+        self.momentum = momentum
         self.eps = eps
-        
-        # Use standard BatchNorm1d
-        self.bn = nn.BatchNorm1d(dim, momentum=momentum, eps=eps, affine=True)
-        
-    def forward(self, x: torch.Tensor, compute_log_det: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward batch normalization.
-        
-        Args:
-            x: Input tensor, shape (batch, dim)
-            compute_log_det: Whether to compute log determinant
-            
-        Returns:
-            y: Normalized output, shape (batch, dim)
-            log_det: Log determinant, shape (batch,)
-        """
-        batch_size = x.shape[0]
-        
-        # Apply batch norm
-        y = self.bn(x)
-        
-        if compute_log_det:
-            # Log-det = sum(log|γ / σ|) where σ² = running_var + eps
-            # Since BN is y = γ * (x - μ) / σ + β, the Jacobian diagonal is γ / σ
-            log_det = torch.sum(
-                torch.log(torch.abs(self.bn.weight) / torch.sqrt(self.bn.running_var + self.eps))
-            )
-            # Broadcast to batch size
-            log_det = log_det.expand(batch_size)
+
+        # Learnable affine params (like BN affine=True)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+        # Running stats
+        self.register_buffer("running_mean", torch.zeros(dim))
+        self.register_buffer("running_var", torch.ones(dim))
+
+        # Cache for invertibility in training
+        self._cached_mean = None
+        self._cached_var = None
+
+    def forward(self, x: torch.Tensor, compute_log_det: bool = True):
+        B, D = x.shape
+        assert D == self.dim
+
+        if self.training:
+            mean = x.mean(dim=0)
+            var = x.var(dim=0, unbiased=False)
+
+            # update running stats
+            self.running_mean.mul_(1 - self.momentum).add_(self.momentum * mean.detach())
+            self.running_var.mul_(1 - self.momentum).add_(self.momentum * var.detach())
+
+            # cache for inverse
+            self._cached_mean = mean
+            self._cached_var = var
         else:
-            log_det = torch.zeros(batch_size, device=x.device)
-        
+            mean = self.running_mean
+            var = self.running_var
+
+        x_hat = (x - mean) / torch.sqrt(var + self.eps)
+        y = x_hat * self.weight + self.bias
+
+        if compute_log_det:
+            # per-dim jacobian: weight / sqrt(var + eps)
+            log_det_scalar = torch.sum(torch.log(torch.abs(self.weight)) - 0.5 * torch.log(var + self.eps))
+            log_det = log_det_scalar.expand(B)
+        else:
+            log_det = torch.zeros(B, device=x.device)
+
         return y, log_det
-    
+
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Inverse batch normalization.
-        
-        Args:
-            y: Normalized input, shape (batch, dim)
-            
-        Returns:
-            x: Original data, shape (batch, dim)
-        """
-        # Inverse: x = σ/γ * (y - β) + μ
-        # where σ² = running_var + eps
-        sigma = torch.sqrt(self.bn.running_var + self.eps)
-        x = sigma / self.bn.weight * (y - self.bn.bias) + self.bn.running_mean
+        if self.training and (self._cached_mean is not None) and (self._cached_var is not None):
+            mean = self._cached_mean
+            var = self._cached_var
+        else:
+            mean = self.running_mean
+            var = self.running_var
+
+        x_hat = (y - self.bias) / (self.weight + 1e-12)
+        x = x_hat * torch.sqrt(var + self.eps) + mean
         return x
+
 
 
 class MADE(nn.Module):
@@ -290,6 +295,26 @@ class MADE(nn.Module):
         if self.conditioning_dim > 0 and h is None:
             logger.error("Conditioning features h required but not provided")
             raise ValueError("Conditioning features h required when conditioning_dim > 0")
+        
+        # --- Adapt conditioning h to [B, conditioning_dim] if needed ---
+        if h is not None:
+            # If h is spatial (e.g. MNIST image), pool to [B, C]
+            if h.dim() == 4:  # [B, C, H, W]
+                h = h.mean(dim=(2, 3))  # -> [B, C]
+
+            # Ensure h is 2D now
+            if h.dim() != 2:
+                raise RuntimeError(f"MADE expects h as [B, h_dim] (or [B,C,H,W]), got {h.shape}")
+
+            # If channel dim != conditioning_dim, project it
+            if self.conditioning_dim > 0 and h.shape[1] != self.conditioning_dim:
+                # Create projection lazily the first time we see this mismatch
+                if not hasattr(self, "h_proj") or self.h_proj is None:
+                    self.h_proj = nn.Linear(h.shape[1], self.conditioning_dim).to(h.device)
+                h = self.h_proj(h)
+        # --- end conditioning adapter ---
+                
+        
         
         # For non-FiLM case, concatenate conditioning to input
         if self.conditioning_dim > 0 and not self.use_film:

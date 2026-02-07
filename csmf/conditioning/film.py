@@ -1,16 +1,23 @@
 """
 FiLM (Feature-wise Linear Modulation)
-Applies γ(h) ⊙ f + β(h) transformation
+Applies γ(h) ⊙ f + β(h) transformation with identity initialization
 
-Version: WP0.1-FiLM-v1.0
-Last Modified: 2025-12-09
+Version: WP0.1-FiLM-v1.0.3
+Last Modified: 2025-02-04
 Changelog:
+  v1.0.3 (2025-02-04): Added 4 targeted debug checks: Broadcasting, Order, Range, Weak Conditioning
+  v1.0.2 (2025-02-03): Added comprehensive debug steps to diagnose modulation error
+  v1.0.1 (2025-02-03): Added identity initialization (gamma=1+δ, beta=δ), configurable scale_factor=0.3
   v1.0 (2025-12-09): Initial implementation with spatial/vector support
 Dependencies: torch>=2.0
 """
 
 import torch
 import torch.nn as nn
+import logging
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 
 class MLP(nn.Module):
@@ -36,27 +43,38 @@ class MLP(nn.Module):
 
 class FiLM(nn.Module):
     """
-    Feature-wise Linear Modulation
+    Feature-wise Linear Modulation with identity initialization
     
     Args:
-        h_dim: Dimension of conditioning features h
         f_dim: Dimension of features to modulate f
+        h_dim: Dimension of conditioning features h
         hidden_dims: List of hidden layer dimensions for MLPs
+        scale_factor: Scale for modulation parameters (default=0.3)
+                     Controls strength of conditioning - higher = stronger effect
+        debug: Enable diagnostic logging of gamma/beta ranges (default=False)
     """
     
-    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128]):
+    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=5.0, debug=False):
         super().__init__()
+        
+        # Set seed for reproducibility
+        torch.manual_seed(2026)
         
         self.h_dim = h_dim
         self.f_dim = f_dim
+        self.scale_factor = scale_factor
+        self.debug = debug
         
         # Separate MLPs for gamma (scale) and beta (shift)
         self.gamma_mlp = MLP(h_dim, f_dim, hidden_dims)
         self.beta_mlp = MLP(h_dim, f_dim, hidden_dims)
+        
+        if self.debug:
+            logger.info(f"FiLM initialized: f_dim={f_dim}, h_dim={h_dim}, scale_factor={scale_factor}")
     
     def forward(self, f, h):
         """
-        Apply FiLM transformation: γ(h) ⊙ f + β(h)
+        Apply FiLM transformation: (1 + scale*γ_mlp(h)) ⊙ f + scale*β_mlp(h)
         
         Args:
             f: Features to modulate [B, f_dim] or [B, f_dim, H, W]
@@ -65,19 +83,152 @@ class FiLM(nn.Module):
         Returns:
             Modulated features (same shape as f)
         """
+        # ========== DEBUG CHECK 1: TENSOR BROADCASTING (The "Shape" Problem) ==========
+        if self.debug:
+            logger.debug("=" * 70)
+            logger.debug("[DEBUG 1] TENSOR BROADCASTING CHECK")
+            logger.debug(f"  Input f shape: {f.shape}")
+            logger.debug(f"  Input h shape: {h.shape}")
+            logger.debug(f"  Expected f_dim: {self.f_dim}, h_dim: {self.h_dim}")
+            
+            # Validate dimensions match expectations
+            if f.dim() == 2 and f.shape[1] != self.f_dim:
+                logger.error(f"  ❌ f dimension mismatch! Got {f.shape[1]}, expected {self.f_dim}")
+            if f.dim() == 4 and f.shape[1] != self.f_dim:
+                logger.error(f"  ❌ f channel dimension mismatch! Got {f.shape[1]}, expected {self.f_dim}")
+        
         # Handle spatial conditioning features
+        h_original_shape = h.shape
         if h.dim() == 4:  # [B, h_dim, H, W]
             h = torch.mean(h, dim=[2, 3])  # Global average pooling → [B, h_dim]
+            if self.debug:
+                logger.debug(f"  h spatial pooling: {h_original_shape} -> {h.shape}")
         
-        # Compute modulation parameters
-        gamma = self.gamma_mlp(h)  # [B, f_dim]
-        beta = self.beta_mlp(h)    # [B, f_dim]
+        # Compute modulation deltas
+        gamma_delta = self.gamma_mlp(h)  # [B, f_dim]
+        beta_delta = self.beta_mlp(h)    # [B, f_dim]
+        
+        # ========== DEBUG CHECK 3: MLP OUTPUT RANGE ==========
+        if self.debug:
+            logger.debug("=" * 70)
+            logger.debug("[DEBUG 3] MLP OUTPUT RANGE CHECK")
+            logger.debug(f"  gamma_delta: shape={gamma_delta.shape}")
+            logger.debug(f"    min={gamma_delta.min().item():.6f}, max={gamma_delta.max().item():.6f}")
+            logger.debug(f"    mean={gamma_delta.mean().item():.6f}, std={gamma_delta.std().item():.6f}")
+            logger.debug(f"  beta_delta: shape={beta_delta.shape}")
+            logger.debug(f"    min={beta_delta.min().item():.6f}, max={beta_delta.max().item():.6f}")
+            logger.debug(f"    mean={beta_delta.mean().item():.6f}, std={beta_delta.std().item():.6f}")
+            
+            # Check for exploding/vanishing
+            if gamma_delta.abs().max() > 10:
+                logger.warning(f"  ⚠️  gamma_delta may be exploding (max={gamma_delta.abs().max().item():.2f})")
+            if gamma_delta.abs().max() < 0.001:
+                logger.warning(f"  ⚠️  gamma_delta may be vanishing (max={gamma_delta.abs().max().item():.2e})")
+        
+        # Apply identity initialization: gamma starts at 1, beta at 0
+        gamma = 1.0 + self.scale_factor * gamma_delta  # [B, f_dim]
+        beta = self.scale_factor * beta_delta          # [B, f_dim]
+        
+        # ========== DEBUG CHECK 4: WEAK CONDITIONING SIGNAL ==========
+        if self.debug:
+            logger.debug("=" * 70)
+            logger.debug("[DEBUG 4] WEAK CONDITIONING SIGNAL CHECK")
+            logger.debug(f"  scale_factor: {self.scale_factor}")
+            logger.debug(f"  gamma (1 + scale*delta):")
+            logger.debug(f"    min={gamma.min().item():.6f}, max={gamma.max().item():.6f}")
+            logger.debug(f"    mean={gamma.mean().item():.6f} (ideal ~1.0 for identity)")
+            logger.debug(f"    deviation from 1: {(gamma - 1.0).abs().mean().item():.6f}")
+            logger.debug(f"  beta (scale*delta):")
+            logger.debug(f"    min={beta.min().item():.6f}, max={beta.max().item():.6f}")
+            logger.debug(f"    mean={beta.mean().item():.6f} (ideal ~0.0 for identity)")
+            logger.debug(f"    abs mean: {beta.abs().mean().item():.6f}")
+            
+            # Weak conditioning diagnostics
+            gamma_deviation = (gamma - 1.0).abs().mean().item()
+            beta_strength = beta.abs().mean().item()
+            
+            if gamma_deviation < 0.01:
+                logger.warning(f"  ⚠️  gamma too close to 1 (deviation={gamma_deviation:.6f}) → weak scale modulation")
+            if beta_strength < 0.01:
+                logger.warning(f"  ⚠️  beta too close to 0 (strength={beta_strength:.6f}) → weak shift modulation")
+            
+            # Overall conditioning strength
+            conditioning_strength = gamma_deviation + beta_strength
+            logger.debug(f"  Overall conditioning strength: {conditioning_strength:.6f}")
+            if conditioning_strength < 0.02:
+                logger.error(f"  ❌ WEAK CONDITIONING! strength={conditioning_strength:.6f} << 0.1")
+        
+        # Store pre-broadcast shapes for verification
+        gamma_pre = gamma.clone() if self.debug else None
+        beta_pre = beta.clone() if self.debug else None
         
         # Handle spatial features to modulate
         if f.dim() == 4:  # [B, f_dim, H, W]
             # Reshape for broadcasting
             gamma = gamma.unsqueeze(-1).unsqueeze(-1)  # [B, f_dim, 1, 1]
             beta = beta.unsqueeze(-1).unsqueeze(-1)    # [B, f_dim, 1, 1]
+            
+            if self.debug:
+                logger.debug("=" * 70)
+                logger.debug("[DEBUG 1 CONTINUED] BROADCASTING FOR SPATIAL")
+                logger.debug(f"  gamma: {gamma_pre.shape} -> {gamma.shape}")
+                logger.debug(f"  beta: {beta_pre.shape} -> {beta.shape}")
+                logger.debug(f"  f spatial: {f.shape}")
+                
+                # Verify broadcasting will work
+                try:
+                    test_broadcast = gamma * f
+                    logger.debug(f"  ✓ Broadcasting test passed: result shape = {test_broadcast.shape}")
+                except RuntimeError as e:
+                    logger.error(f"  ❌ Broadcasting FAILED: {e}")
         
-        # Apply FiLM transformation
-        return gamma * f + beta
+        # ========== DEBUG CHECK 2: ORDER OF OPERATIONS ==========
+        if self.debug:
+            logger.debug("=" * 70)
+            logger.debug("[DEBUG 2] ORDER OF OPERATIONS CHECK")
+            logger.debug(f"  Formula: gamma * f + beta")
+            logger.debug(f"  Step 1: gamma * f")
+            
+        # Apply FiLM transformation: gamma * f + beta
+        gamma_times_f = gamma * f
+        
+        if self.debug:
+            logger.debug(f"    Result: shape={gamma_times_f.shape}, norm={gamma_times_f.norm().item():.6f}")
+            logger.debug(f"  Step 2: (gamma * f) + beta")
+        
+        result = gamma_times_f + beta
+        
+        if self.debug:
+            logger.debug(f"    Result: shape={result.shape}, norm={result.norm().item():.6f}")
+            
+            # Verify order matters by testing wrong order
+            wrong_order = beta * f + gamma
+            wrong_diff = (result - wrong_order).abs().max().item()
+            logger.debug(f"  Order verification: diff from wrong order (beta*f + gamma) = {wrong_diff:.6f}")
+            if wrong_diff < 1e-6:
+                logger.error(f"  ❌ ORDER BUG! Result same as wrong order (commutative - shouldn't be!)")
+            else:
+                logger.debug(f"  ✓ Order correct (non-commutative as expected)")
+        
+        # ========== FINAL CHECKS ==========
+        if self.debug:
+            logger.debug("=" * 70)
+            logger.debug("[DEBUG FINAL] RESULT VALIDATION")
+            logger.debug(f"  Input f norm: {f.norm().item():.6f}")
+            logger.debug(f"  Output result norm: {result.norm().item():.6f}")
+            logger.debug(f"  Change ratio: {(result.norm() / f.norm()).item():.6f}")
+            
+            # Check for NaN or Inf
+            if torch.isnan(result).any():
+                logger.error("  ❌ NaN detected in result!")
+            if torch.isinf(result).any():
+                logger.error("  ❌ Inf detected in result!")
+            
+            # Manual verification: recompute to ensure no bugs
+            manual_result = gamma * f + beta
+            manual_diff = (result - manual_result).abs().max().item()
+            logger.debug(f"  Self-check diff: {manual_diff:.2e} (should be ~0)")
+            
+            logger.debug("=" * 70)
+        
+        return result
