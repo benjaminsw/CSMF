@@ -165,64 +165,66 @@ class ConditionalRQSplineCoupling(nn.Module):
         )
     
     def forward(self, x, h):
-        """
-        Args:
-            x: (B, d) input
-            h: (B, cond_dim) conditioning
-        
-        Returns:
-            z: (B, d) output
-            log_det: (B,) log-Jacobian
-        """
-        xA, xB = x.chunk(2, dim=1)
-        
-        # Compute spline parameters from xA and h
+        # Accept either full (B, dim) or half (B, dim//2)
+        if x.shape[1] == self.param_net[0].in_features - h.shape[1]:  # dim//2
+            xA = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=x.dtype)
+            xB = x
+            half_only = True
+        else:
+            xA, xB = x.chunk(2, dim=1)
+            half_only = False
+
         inp = torch.cat([xA, h], dim=1)
-        params = self.param_net(inp)  # (B, (d/2) * (3K-1))
-        
-        # Split into widths, heights, derivatives
-        params = params.reshape(x.shape[0], -1, 3*self.K - 1)  # (B, d/2, 3K-1)
+        params = self.param_net(inp)
+
+        params = params.reshape(x.shape[0], -1, 3*self.K - 1)
         widths_raw = params[..., :self.K]
         heights_raw = params[..., self.K:2*self.K]
         derivatives_raw = params[..., 2*self.K:]
-        
-        # Normalize to valid ranges
+
         widths = F.softmax(widths_raw, dim=-1) * 2 * self.B
         heights = F.softmax(heights_raw, dim=-1) * 2 * self.B
-        derivatives = F.softplus(derivatives_raw) + 1e-3  # ensure positive
-        
-        # Apply spline transform
+        derivatives = F.softplus(derivatives_raw) + 1e-3
+
         xB_new, log_det_B = RationalQuadraticSpline.forward(
             xB, widths, heights, derivatives, B=self.B
         )
-        
-        log_det = log_det_B.sum(dim=1)  # sum over dimensions
-        
+        log_det = log_det_B.sum(dim=1)
+
+        if half_only:
+            return xB_new, log_det
         return torch.cat([xA, xB_new], dim=1), log_det
+
     
     def inverse(self, z, h):
-        """Inverse via quadratic solve"""
-        zA, zB = z.chunk(2, dim=1)
-        
-        # Recompute same parameters (deterministic given zA, h)
+        if z.shape[1] == (self.param_net[0].in_features - h.shape[1]):  # dim//2
+            zA = torch.zeros(z.shape[0], z.shape[1], device=z.device, dtype=z.dtype)
+            zB = z
+            half_only = True
+        else:
+            zA, zB = z.chunk(2, dim=1)
+            half_only = False
+
         inp = torch.cat([zA, h], dim=1)
         params = self.param_net(inp)
-        
+
         params = params.reshape(z.shape[0], -1, 3*self.K - 1)
         widths_raw = params[..., :self.K]
         heights_raw = params[..., self.K:2*self.K]
         derivatives_raw = params[..., 2*self.K:]
-        
+
         widths = F.softmax(widths_raw, dim=-1) * 2 * self.B
         heights = F.softmax(heights_raw, dim=-1) * 2 * self.B
         derivatives = F.softplus(derivatives_raw) + 1e-3
-        
-        # Invert spline
+
         xB = RationalQuadraticSpline.inverse(
             zB, widths, heights, derivatives, B=self.B
         )
-        
+
+        if half_only:
+            return xB
         return torch.cat([zA, xB], dim=1)
+
 
 
 class ConditionalNSF(nn.Module):
@@ -265,14 +267,45 @@ class ConditionalNSF(nn.Module):
         
         return z, log_det
     
+    
+    def _bn_inverse(self, bn: nn.BatchNorm1d, y: torch.Tensor) -> torch.Tensor:
+        # In eval mode BN is affine using running stats
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+
+        if bn.affine:
+            w = bn.weight
+            b = bn.bias
+            w = torch.where(w == 0, torch.ones_like(w), w)  # safety
+            x = (y - b) / w
+        else:
+            x = y
+
+        x = x * torch.sqrt(var + eps) + mean
+        return x
+
+        
     def inverse(self, z, h):
-        """
-        Inverse: z → x (for sampling)
-        """
         x = z
         for layer in reversed(self.layers):
             if isinstance(layer, ConditionalRQSplineCoupling):
                 x = layer.inverse(x, h)
+            elif isinstance(layer, nn.BatchNorm1d):
+                x = self._bn_inverse(layer, x)
+        return x
+
+    
+    
+    
+    #def inverse(self, z, h):
+        """
+        Inverse: z → x (for sampling)
+        """
+    #    x = z
+    #    for layer in reversed(self.layers):
+    #        if isinstance(layer, ConditionalRQSplineCoupling):
+    #            x = layer.inverse(x, h)
             # Skip BatchNorm in inverse
         
-        return x
+    #    return x

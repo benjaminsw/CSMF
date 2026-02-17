@@ -32,6 +32,10 @@ from typing import Tuple, Callable
 import sys
 import os
 
+from csmf.flows.conditional_nice import ConditionalNICE, ConditionalAdditiveCoupling
+from csmf.flows.conditional_nsf import ConditionalNSF, ConditionalRQSplineCoupling
+
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

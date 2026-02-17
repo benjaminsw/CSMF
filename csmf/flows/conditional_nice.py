@@ -105,19 +105,52 @@ class ConditionalNICE(nn.Module):
         
         return z, log_det
     
-    def inverse(self, z, h):
+    #def inverse(self, z, h):
         """
         Inverse: z → x (for sampling)
         
         Reverse order + undo scaling
         """
-        # Undo final scaling
-        x = z * torch.exp(-self.scaling)
+    #    # Undo final scaling
+    #    x = z * torch.exp(-self.scaling)
         
         # Reverse layers
+    #    for layer in reversed(self.layers):
+    #        if isinstance(layer, ConditionalAdditiveCoupling):
+    #            x = layer.inverse(x, h)
+            # Skip BatchNorm in inverse (assume eval mode)
+        
+    #    return x
+    
+    # inside ConditionalNICE class
+
+    def _batchnorm1d_inverse(self, bn: nn.BatchNorm1d, y: torch.Tensor) -> torch.Tensor:
+        # Works in eval mode (uses running_mean / running_var)
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+
+        if bn.affine:
+            weight = bn.weight
+            bias = bn.bias
+            # avoid divide-by-zero if someone ever sets weight=0
+            weight_safe = torch.where(weight == 0, torch.ones_like(weight), weight)
+            x = (y - bias) / weight_safe
+        else:
+            x = y
+
+        x = x * torch.sqrt(var + eps) + mean
+        return x
+
+    def inverse(self, z, h):
+        # Undo final scaling
+        x = z * torch.exp(-self.scaling)
+
+        # Reverse layers, and invert BOTH coupling and batchnorm
         for layer in reversed(self.layers):
             if isinstance(layer, ConditionalAdditiveCoupling):
                 x = layer.inverse(x, h)
-            # Skip BatchNorm in inverse (assume eval mode)
-        
+            elif isinstance(layer, nn.BatchNorm1d):
+                x = self._batchnorm1d_inverse(layer, x)
+
         return x
