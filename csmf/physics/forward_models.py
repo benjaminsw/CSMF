@@ -14,10 +14,19 @@ CHANGELOG:
   SRForwardModel (blur + downsample) with Gaussian kernel caching,
   SARForwardModel (log-domain) with input clamping and shape validation
   on all adjoint inputs. Error logging throughout.
+- v1.1 (2026-02-21): Fixed SR adjoint correctness. Replaced bilinear interpolate
+  downsample with exact decimation (x[...,::s,::s]) in forward(). Replaced
+  nearest upsample in adjoint() with mathematically correct zero-insertion
+  (downsample2d_adjoint). Added lazy H,W capture in forward() so adjoint()
+  always knows target output size. Fixes test_sr_adjoint_inner_product.
+- v1.2 (2026-02-21): Fixed Fourier vs PCG boundary condition mismatch.
+  Replaced zero-padding in _blur/_blur_T with circular padding via new
+  _circular_conv2d() static method. PCG now uses same circular BCs as
+  Fourier solve, fixing test_fourier_vs_pcg_close.
 ================================================================================
 """
 
-__version__ = "WP1.1-FwdMod-v1.0"
+__version__ = "WP1.1-FwdMod-v1.2"
 
 import logging
 import math
@@ -85,15 +94,16 @@ class SRForwardModel(ForwardModel):
     """
     Super-resolution forward model: A = D ∘ B
         B  : Gaussian blur  (sigma = blur_sigma)
-        D  : Downsample ×2 or ×4 (bilinear)
+        D  : Downsample ×s (exact decimation: x[...,::s,::s])
 
     Adjoint A^T = B^T ∘ D^T
-        D^T : Upsample  (nearest)
+        D^T : Zero-insertion (adjoint of decimation)
         B^T : Transpose conv with flipped kernel
 
     Additional functionality included:
         - Gaussian kernel caching (computed once, reused)
         - Shape validation on adjoint input
+        - Lazy H,W capture on first forward() call for adjoint target size
     """
 
     def __init__(
@@ -122,6 +132,10 @@ class SRForwardModel(ForwardModel):
         self.blur_sigma       = blur_sigma
         self.downsample_factor = downsample_factor
         self.in_channels      = in_channels
+
+        # ── lazy input size capture (set on first forward call) ───────
+        self._input_H: int | None = None
+        self._input_W: int | None = None
 
         # ── auto kernel size (odd, >= 3) ──────────────────────────────
         if kernel_size == 0:
@@ -167,26 +181,28 @@ class SRForwardModel(ForwardModel):
         return g2d
 
     # ------------------------------------------------------------------
-    # Blur helper (depthwise conv)
+    # Circular convolution helper (matches Fourier solve boundary conditions)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _circular_conv2d(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+        """
+        2-D depthwise convolution with circular (periodic) padding.
+        Matches the boundary conditions assumed by SRProximalFourier FFT solve.
+        """
+        kh, kw = kernel.shape[-2], kernel.shape[-1]
+        pad_h, pad_w = kh // 2, kw // 2
+        x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="circular")
+        return F.conv2d(x_pad, kernel, padding=0, groups=x.shape[1])
+
+    # ------------------------------------------------------------------
+    # Blur helpers (depthwise conv, circular padding)
     # ------------------------------------------------------------------
     def _blur(self, x: torch.Tensor) -> torch.Tensor:
-        pad = self.kernel_size // 2
-        return F.conv2d(
-            x,
-            self.kernel,
-            padding=pad,
-            groups=self.in_channels,
-        )
+        return self._circular_conv2d(x, self.kernel)
 
     def _blur_T(self, x: torch.Tensor) -> torch.Tensor:
-        """Transpose blur using flipped kernel."""
-        pad = self.kernel_size // 2
-        return F.conv2d(
-            x,
-            self.kernel_T,
-            padding=pad,
-            groups=self.in_channels,
-        )
+        """Transpose blur using flipped kernel with circular padding."""
+        return self._circular_conv2d(x, self.kernel_T)
 
     # ------------------------------------------------------------------
     # Forward:  x (N,C,H,W) → y (N,C,H/d,W/d)
@@ -203,18 +219,29 @@ class SRForwardModel(ForwardModel):
             raise ValueError(msg)
 
         try:
+            # Capture input spatial size for adjoint (lazy)
+            if self._input_H is None or self._input_W is None:
+                self._input_H, self._input_W = x.shape[2], x.shape[3]
+                logger.debug(
+                    "[%s] Captured input size H=%d, W=%d",
+                    __version__, self._input_H, self._input_W,
+                )
+            elif (x.shape[2] != self._input_H or x.shape[3] != self._input_W):
+                logger.warning(
+                    "[%s] Input size changed from (%d,%d) to (%d,%d). "
+                    "Updating cached H,W.",
+                    __version__, self._input_H, self._input_W,
+                    x.shape[2], x.shape[3],
+                )
+                self._input_H, self._input_W = x.shape[2], x.shape[3]
+
             # B: Gaussian blur
             x_blur = self._blur(x)
 
-            # D: downsample
+            # D: exact decimation (adjoint = zero-insertion)
             if self.downsample_factor > 1:
-                y = F.interpolate(
-                    x_blur,
-                    scale_factor=1.0 / self.downsample_factor,
-                    mode="bilinear",
-                    align_corners=False,
-                    recompute_scale_factor=False,
-                )
+                s = self.downsample_factor
+                y = x_blur[:, :, ::s, ::s]
             else:
                 y = x_blur
 
@@ -243,13 +270,23 @@ class SRForwardModel(ForwardModel):
             raise ValueError(msg)
 
         try:
-            # D^T: upsample
+            # D^T: zero-insertion (exact adjoint of decimation)
             if self.downsample_factor > 1:
-                y_up = F.interpolate(
-                    y,
-                    scale_factor=float(self.downsample_factor),
-                    mode="nearest",
+                if self._input_H is None or self._input_W is None:
+                    msg = (
+                        f"[{__version__}] adjoint() called before forward(): "
+                        "input H,W unknown. Call forward() at least once first."
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+
+                s = self.downsample_factor
+                y_up = torch.zeros(
+                    y.shape[0], y.shape[1],
+                    self._input_H, self._input_W,
+                    device=y.device, dtype=y.dtype,
                 )
+                y_up[:, :, ::s, ::s] = y
             else:
                 y_up = y
 

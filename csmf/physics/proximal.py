@@ -1,7 +1,7 @@
 """
 ================================================================================
 FILE:    csmf/physics/proximal.py
-VERSION: WP1.1-Prox-v1.0
+VERSION: WP1.1-Prox-v1.2
 ABBR:    PROX
 DESC:    Proximal operators for SR and SAR inverse problems.
          Solves: arg min_z [ ||Az-y||²/2σ² + λ||z-x||² ]
@@ -20,10 +20,18 @@ CHANGELOG:
   dispatch and PCG (diagonal preconditioner + per-iter residual tracking).
   SRProximalFourier using FFT normal equations. SARProximal log-domain
   closed-form with positive clamping. Error logging throughout.
+- v1.1 (2026-02-21): Fixed SRProximalFourier kernel phase misalignment.
+  Applied ifftshift to kernel_2d before rfft2 so DC is at origin, making
+  conj(H)*Y match adjoint(y) in spatial domain. Added downsample_factor
+  guard in __init__ (raises ValueError if != 1). Fixes test_fourier_vs_pcg_close.
+- v1.2 (2026-02-21): Replaced manual kernel extraction + ifftshift in
+  SRProximalFourier with impulse-response method. H now built by passing
+  a unit impulse through forward_model.forward() directly, guaranteeing
+  exact consistency with PCG's A operator. __init__ now accepts forward_model.
 ================================================================================
 """
 
-__version__ = "WP1.1-Prox-v1.0"
+__version__ = "WP1.1-Prox-v1.2"
 
 import logging
 from typing import List, Optional, Tuple
@@ -303,20 +311,23 @@ class SRProximalFourier:
 
     Then z = Re{ IFFT2(Z) }
 
+    H is derived from the forward_model's impulse response, guaranteeing
+    exact consistency with PCG's A operator (forward + adjoint).
+
     This is O(N log N) vs O(N³) for dense pseudo-inverse.
 
     Note: Only valid when A = B (blur only, no downsample).
           For A = D∘B (blur + downsample), use PCG.
 
     Args:
-        kernel : Gaussian blur kernel (1, 1, ks, ks) or (C, 1, ks, ks)
-        sigma  : noise level
-        lam    : regularisation weight
+        forward_model : SRForwardModel with downsample_factor=1
+        sigma         : noise level
+        lam           : regularisation weight
     """
 
     def __init__(
         self,
-        kernel: torch.Tensor,
+        forward_model,
         sigma: float = 0.1,
         lam:   float = 0.1,
     ):
@@ -328,18 +339,30 @@ class SRProximalFourier:
             msg = f"[{__version__}] SRProximalFourier: lam must be >= 0, got {lam}"
             logger.error(msg)
             raise ValueError(msg)
-        if kernel.ndim not in (2, 3, 4):
-            msg = f"[{__version__}] SRProximalFourier: kernel must be 2-4D, got {kernel.ndim}D"
+        if not hasattr(forward_model, "forward") or not hasattr(forward_model, "adjoint"):
+            msg = (
+                f"[{__version__}] SRProximalFourier: forward_model must have "
+                ".forward() and .adjoint() methods."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+        if getattr(forward_model, "downsample_factor", 1) != 1:
+            msg = (
+                f"[{__version__}] SRProximalFourier only valid for downsample_factor=1 "
+                f"(blur-only, no decimation). Got downsample_factor="
+                f"{forward_model.downsample_factor}. "
+                "Use ProximalOperator with method='pcg' for downsampling models."
+            )
             logger.error(msg)
             raise ValueError(msg)
 
-        self.kernel = kernel
-        self.sigma  = sigma
-        self.lam    = lam
+        self.A     = forward_model
+        self.sigma = sigma
+        self.lam   = lam
 
         logger.info(
-            "[%s] SRProximalFourier created: sigma=%.4f, lam=%.4f, kernel_shape=%s",
-            __version__, sigma, lam, tuple(kernel.shape),
+            "[%s] SRProximalFourier created: sigma=%.4f, lam=%.4f",
+            __version__, sigma, lam,
         )
 
     def solve(
@@ -390,15 +413,21 @@ class SRProximalFourier:
             X = torch.fft.rfft2(x)                               # (N, C, H, W//2+1)
             Y = torch.fft.rfft2(y)
 
-            # ── FFT of kernel (pad to image size) ─────────────────────
-            kernel_2d = self.kernel
-            if kernel_2d.ndim == 4:
-                kernel_2d = kernel_2d[0, 0]                      # (ks, ks)
-            elif kernel_2d.ndim == 3:
-                kernel_2d = kernel_2d[0]
-
-            kernel_2d = kernel_2d.to(x.device)
-            H = torch.fft.rfft2(kernel_2d, s=H_size)            # (H, W//2+1)
+            # ── H from impulse response (exact match with PCG's A) ────
+            # Pass a unit impulse at [0,0] through forward_model.forward()
+            # so H is guaranteed consistent with adjoint() used by PCG.
+            # This avoids any kernel extraction / ifftshift ambiguity.
+            impulse = torch.zeros(1, x.shape[1], *H_size, device=x.device, dtype=x.dtype)
+            impulse[0, :, 0, 0] = 1.0
+            try:
+                h_spatial = self.A.forward(impulse)              # (1, C, H, W)
+            except Exception as e:
+                logger.error(
+                    "[%s] SRProximalFourier: impulse response failed: %s",
+                    __version__, e,
+                )
+                raise
+            H = torch.fft.rfft2(h_spatial[0, 0])                # (H, W//2+1)
 
             # ── Wiener-like normal equation in frequency domain ───────
             H_conj  = torch.conj(H)
