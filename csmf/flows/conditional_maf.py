@@ -370,6 +370,7 @@ class ConditionalMAF(nn.Module):
         self,
         dim: int = 784,
         h_dim: int = 64,
+        cond_dim: int = None,
         n_flows: int = 4,
         hidden_dims: List[int] = None,
         use_batch_norm: bool = True,
@@ -389,6 +390,10 @@ class ConditionalMAF(nn.Module):
             config: Optional config dict from MNIST_CONFIG
         """
         super().__init__()
+        
+        # cond_dim is an alias for h_dim (API consistency with NICE/NSF)
+        if cond_dim is not None:
+            h_dim = cond_dim
         
         # Version tracking
         self.version = "W0.1-MAF-v2.0"

@@ -137,9 +137,9 @@ def build_dataloaders(
     data_root: str,
     batch_size: int,
     val_split: float,
-    blur_k: int,
-    down: int,
-    sigma: float,
+    blur_kernel_size: int,
+    downsample_factor: int,
+    noise_std: float,
     logger: logging.Logger,
 ) -> tuple:
     """
@@ -150,11 +150,11 @@ def build_dataloaders(
     """
     train_full = MNISTInverseDataset(
         root=data_root, train=True,
-        blur_k=blur_k, down=down, sigma=sigma,
+        blur_kernel_size=blur_kernel_size, downsample_factor=downsample_factor, noise_std=noise_std,
     )
     test_ds = MNISTInverseDataset(
         root=data_root, train=False,
-        blur_k=blur_k, down=down, sigma=sigma,
+        blur_kernel_size=blur_kernel_size, downsample_factor=downsample_factor, noise_std=noise_std,
     )
 
     n_val   = int(len(train_full) * val_split)
@@ -173,7 +173,7 @@ def build_dataloaders(
 
     logger.info(
         f"Data | train={n_train} | val={n_val} | test={len(test_ds)} | "
-        f"batch={batch_size} | blur_k={blur_k} | down={down} | sigma={sigma}"
+        f"batch={batch_size} | blur_kernel_size={blur_kernel_size} | downsample_factor={downsample_factor} | noise_std={noise_std}"
     )
     return train_loader, val_loader, test_loader
 
@@ -219,24 +219,29 @@ def build_model(
     for name in active_experts:
         cls = EXPERT_REGISTRY[name]
         try:
-            expert = cls(dim=latent_dim, cond_dim=hidden_dim, num_layers=num_layers)
+            if name == "realnvp":
+                # ConditionalRealNVP uses h_dim; hardcodes 28x28 MNIST dims internally
+                expert = cls(h_dim=hidden_dim)
+                expert.dim = latent_dim  # required by CSMF for gate/sampling
+            else:
+                # ConditionalMAF, ConditionalNICE, ConditionalNSF use dim + cond_dim
+                expert = cls(dim=latent_dim, cond_dim=hidden_dim)
         except TypeError as e:
             logger.error(
-                f"Failed to instantiate expert '{name}' with "
-                f"dim={latent_dim}, cond_dim={hidden_dim}, num_layers={num_layers} | {e}"
+                f"Failed to instantiate expert '{name}' | {e}"
             )
             raise
         experts.append(expert)
         logger.info(
             f"Expert added: '{name}' ({cls.__name__}) | "
-            f"dim={latent_dim} | cond_dim={hidden_dim} | layers={num_layers}"
+            f"dim={latent_dim} | cond_dim/h_dim={hidden_dim}"
         )
 
     K = len(experts)
 
     # Conditioner: y -> h
-    conditioner = MNISTConditioner(out_dim=hidden_dim)
-    logger.info(f"Conditioner: MNISTConditioner | out_dim={hidden_dim}")
+    conditioner = MNISTConditioner(h_dim=hidden_dim)
+    logger.info(f"Conditioner: MNISTConditioner | h_dim={hidden_dim}")
 
     # Gate: h -> logits (K,)
     gate = nn.Sequential(
@@ -264,7 +269,7 @@ def build_loss(
     logger: logging.Logger,
 ) -> HybridLoss:
     """Build HybridLoss with SR forward model."""
-    fwd_model = SRForwardModel(blur_sigma=1.0, downsample=downsample_factor)
+    fwd_model = SRForwardModel(blur_sigma=1.0, downsample_factor=downsample_factor)
     loss_fn   = HybridLoss(
         fwd_model,
         lambda_cons=lambda_cons,
@@ -438,13 +443,13 @@ def main() -> None:
 
     # --- Data ---
     train_loader, val_loader, test_loader = build_dataloaders(
-        data_root  = DATA_ROOT,
-        batch_size = batch_size,
-        val_split  = VAL_SPLIT,
-        blur_k     = BLUR_KERNEL,
-        down       = DOWNSAMPLE_FACTOR,
-        sigma      = NOISE_SIGMA,
-        logger     = logger,
+        data_root        = DATA_ROOT,
+        batch_size       = batch_size,
+        val_split        = VAL_SPLIT,
+        blur_kernel_size = BLUR_KERNEL,
+        downsample_factor= DOWNSAMPLE_FACTOR,
+        noise_std        = NOISE_SIGMA,
+        logger           = logger,
     )
 
     # --- Model ---
