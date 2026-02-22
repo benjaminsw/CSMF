@@ -10,6 +10,7 @@
 
 import os
 import logging
+import inspect
 import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple, Dict, Any
@@ -82,6 +83,53 @@ class CSMF(nn.Module):
     # Core: forward / sample
     # =========================================================================
 
+    @staticmethod
+    def _is_image_expert(expert: nn.Module) -> bool:
+        return expert.__class__.__name__ == "ConditionalRealNVP"
+
+    @staticmethod
+    def _expects_raw_y(expert: nn.Module) -> bool:
+        return expert.__class__.__name__ in {"ConditionalRealNVP", "ConditionalMAF"}
+
+    def _prepare_x_for_expert(self, expert: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self._is_image_expert(expert):
+            return x
+        return x.flatten(1) if x.dim() > 2 else x
+
+    def _expert_forward(
+        self,
+        expert: nn.Module,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        x_in = self._prepare_x_for_expert(expert, x)
+        cond = y if self._expects_raw_y(expert) else h
+        out = expert.forward(x_in, cond)
+
+        if not isinstance(out, tuple):
+            raise RuntimeError(f"Unexpected forward output type from {type(expert).__name__}: {type(out)}")
+
+        if len(out) == 2:
+            z, log_det = out
+            return z, log_det, None
+        if len(out) == 3:
+            z, log_det, log_prob = out
+            return z, log_det, log_prob
+        if len(out) == 4:
+            z, _, log_det, log_prob = out
+            return z, log_det, log_prob
+
+        raise RuntimeError(f"Unexpected forward output length from {type(expert).__name__}: {len(out)}")
+
+    def _expert_inverse(self, expert: nn.Module, z: torch.Tensor, y: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        if self._expects_raw_y(expert):
+            sig = inspect.signature(expert.inverse)
+            if len(sig.parameters) <= 2:
+                return expert.inverse(z, y)
+            return expert.inverse(z, y)
+        return expert.inverse(z, h)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -104,7 +152,7 @@ class CSMF(nn.Module):
 
         log_q_experts = []
         for k, expert in enumerate(self.experts):
-            z, log_det = expert.forward(x, h)                 # (B, d), (B,)
+            z, log_det, log_prob = self._expert_forward(expert, x, y, h)
 
             if torch.any(torch.isnan(log_det)):
                 logger.error(
@@ -113,8 +161,12 @@ class CSMF(nn.Module):
                 )
                 raise ValueError(f"NaN in log_det from expert {k}")
 
-            log_p_z = self.base_dist.log_prob(z).sum(dim=1)   # (B,)
-            log_q_experts.append(log_p_z + log_det)           # (B,)
+            if log_prob is not None:
+                log_q_experts.append(log_prob)
+            else:
+                z_flat = z.flatten(1) if z.dim() > 2 else z
+                log_p_z = self.base_dist.log_prob(z_flat).sum(dim=1)   # (B,)
+                log_q_experts.append(log_p_z + log_det)                # (B,)
 
         log_q_experts = torch.stack(log_q_experts, dim=1)     # (B, K)
         log_q         = torch.logsumexp(log_w + log_q_experts, dim=1)  # (B,)
@@ -167,9 +219,14 @@ class CSMF(nn.Module):
             chosen = torch.multinomial(w[i], num_samples, replacement=True)  # (S,)
             for s in range(num_samples):
                 k   = chosen[s].item()
-                z   = self.base_dist.sample((self.dim,)).to(dev)
-                x   = self.experts[k].inverse(z.unsqueeze(0), h[i:i+1])  # (1, d)
-                x_samples[i, s]  = x.squeeze(0)
+                expert = self.experts[k]
+                if self._is_image_expert(expert):
+                    x_img = expert.sample(1, y[i:i+1]).flatten(1)
+                    x_samples[i, s] = x_img.squeeze(0)
+                else:
+                    z = self.base_dist.sample((self.dim,)).to(dev)
+                    x = self._expert_inverse(expert, z.unsqueeze(0), y[i:i+1], h[i:i+1])
+                    x_samples[i, s] = x.squeeze(0)
                 expert_ids[i, s] = k
 
         logger.debug(
@@ -321,8 +378,8 @@ class CSMF(nn.Module):
                 for x_clean, y_deg in dataloader:
                     optimizer.zero_grad()
 
-                    h          = self.conditioner(y_deg)
-                    z, log_det = expert.forward(x_clean, h)
+                    h = self.conditioner(y_deg)
+                    z, log_det, log_prob = self._expert_forward(expert, x_clean, y_deg, h)
 
                     if torch.any(torch.isnan(log_det)):
                         logger.error(
@@ -331,15 +388,28 @@ class CSMF(nn.Module):
                         )
                         continue
 
-                    log_p_z = self.base_dist.log_prob(z).sum(dim=1)
-                    nll     = -(log_p_z + log_det).mean()
+                    if log_prob is not None:
+                        nll = -log_prob.mean()
+                    else:
+                        z_flat = z.flatten(1) if z.dim() > 2 else z
+                        log_p_z = self.base_dist.log_prob(z_flat).sum(dim=1)
+                        nll = -(log_p_z + log_det).mean()
 
                     # Weak consistency via reconstructed sample
                     with torch.no_grad():
-                        z_base = self.base_dist.sample(
-                            (x_clean.shape[0], self.dim)
-                        ).to(x_clean.device)
-                    x_hat = expert.inverse(z_base, h)
+                        if self._expects_raw_y(expert) and hasattr(expert, "sample"):
+                            x_hat = expert.sample(x_clean.shape[0], y_deg)
+                            if x_hat.dim() == 3:
+                                x_hat = x_hat[:, 0, :]
+                            if x_hat.dim() == 2:
+                                x_hat = x_hat.view(-1, 1, 28, 28)
+                        else:
+                            z_base = self.base_dist.sample(
+                                (x_clean.shape[0], self.dim)
+                            ).to(x_clean.device)
+                            x_hat = self._expert_inverse(expert, z_base, y_deg, h)
+                            if x_hat.dim() == 2:
+                                x_hat = x_hat.view(-1, 1, 28, 28)
                     Ax    = hybrid_loss.A.forward(x_hat)
                     cons  = torch.mean((Ax - y_deg) ** 2)
 
@@ -678,10 +748,14 @@ class CSMF(nn.Module):
         n     = 0
 
         for x_clean, y_deg in val_loader:
-            h          = self.conditioner(y_deg)
-            z, log_det = expert.forward(x_clean, h)
-            log_p_z    = self.base_dist.log_prob(z).sum(dim=1)
-            nll        = -(log_p_z + log_det).mean()
+            h = self.conditioner(y_deg)
+            z, log_det, log_prob = self._expert_forward(expert, x_clean, y_deg, h)
+            if log_prob is not None:
+                nll = -log_prob.mean()
+            else:
+                z_flat = z.flatten(1) if z.dim() > 2 else z
+                log_p_z = self.base_dist.log_prob(z_flat).sum(dim=1)
+                nll = -(log_p_z + log_det).mean()
             if torch.isnan(nll):
                 logger.warning("_eval_nll_single: NaN in val batch — skipping")
                 continue
