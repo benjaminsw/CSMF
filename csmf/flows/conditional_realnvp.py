@@ -1,10 +1,16 @@
 """
 ConditionalRealNVP for MNIST Inverse Problems - Multi-Scale Architecture
 
-Version: WP0.3-CondRNVP-v2.1.0
+Version: WP0.3-CondRNVP-v2.1.1
 Abbr: COND-RNVP
-Last Modified: 2025-02-04
+Last Modified: 2026-02-22
 Changelog:
+  v2.1.1 (2026-02-22): [F1] Reduced s_max 10.0→2.0 to prevent exp() explosion across 9 coupling layers;
+                        [F2] Added z_flat clamping (-50,50) before inverse coupling loop in ScaleBlock;
+                        [F3] Added h clamping (-10,10) after conditioner call in inverse();
+                        [A1] Added per-coupling NaN detection in inverse pass with error logging;
+                        [A2] Added input normalization range check in forward() with WARNING if x outside [-1,1];
+                        [A3] Added h.norm() logging for first 50 batches via _h_log_count counter.
   v2.1.0 (2025-02-04): Added comprehensive debugging for invertibility and log-det issues
   v2.0.1 (2025-02-03): Fixed reshape bug in ScaleBlock inverse
   v2.0 (2025-10-25): Multi-scale with squeeze/unsqueeze and variable factoring
@@ -61,7 +67,7 @@ class ScaleBlock(nn.Module):
                 h_dim=h_dim,
                 hidden_dims=hidden_dims,
                 use_batch_norm=False,  # Disable BN for debugging
-                s_max=10.0,
+                s_max=2.0,  # [F1] Reduced from 10.0: exp(10)≈22026 explodes across 9 layers
                 debug=self.debug
             )
             self.coupling_layers.append(layer)
@@ -155,6 +161,13 @@ class ScaleBlock(nn.Module):
             # Re-flatten with correct shape
             z_flat = z_out.reshape(B, -1)
             
+            # [F2] Clamp activations before inverse coupling to prevent NaN from accumulated scale explosion
+            z_flat_pre_clamp = z_flat
+            z_flat = torch.clamp(z_flat, -50.0, 50.0)
+            if torch.any(z_flat != z_flat_pre_clamp):
+                n_clamped = (z_flat != z_flat_pre_clamp).sum().item()
+                logger.warning(f"[F2] Clamped {n_clamped} values in z_flat before inverse coupling (ScaleBlock)")
+            
             if self.debug:
                 logger.debug(f"  Flattened for coupling: shape={z_flat.shape}")
             
@@ -162,6 +175,16 @@ class ScaleBlock(nn.Module):
             for i, coupling in enumerate(reversed(self.coupling_layers)):
                 z_flat, ld = coupling.forward(z_flat, h, reverse=True)
                 log_det = log_det + ld
+                
+                # [A1] Per-coupling NaN detection in inverse pass
+                if torch.any(torch.isnan(z_flat)) or torch.any(torch.isinf(z_flat)):
+                    logger.error(
+                        f"[A1] NaN/Inf detected after inverse coupling "
+                        f"{self.n_layers - i}/{self.n_layers} in ScaleBlock. "
+                        f"NaN count: {torch.isnan(z_flat).sum().item()}, "
+                        f"Inf count: {torch.isinf(z_flat).sum().item()}"
+                    )
+                    z_flat = torch.nan_to_num(z_flat, nan=0.0, posinf=1e4, neginf=-1e4)
                 
                 if self.debug:
                     logger.debug(f"  Coupling {self.n_layers-i}/{self.n_layers} (reversed):")
@@ -221,6 +244,7 @@ class ConditionalRealNVP(nn.Module):
         self.config = config
         self._cached_h = None
         self.debug = debug
+        self._h_log_count = 0  # [A3] Counter for h.norm() logging during first 50 batches
         
         logger.info(f"Initializing ConditionalRealNVP v2.1.0: h_dim={h_dim}, debug={debug}")
         
@@ -278,6 +302,15 @@ class ConditionalRealNVP(nn.Module):
             logger.debug("[REALNVP FORWARD]")
             logger.debug(f"  Input x: shape={x.shape}, norm={x.norm().item():.6f}")
             x_original = x.clone()  # For final invertibility check
+        
+        # [A2] Input normalization range check — MNIST should be dequantized+logit, ~[-5, 5]
+        x_min, x_max = x.min().item(), x.max().item()
+        if x_min < -10.0 or x_max > 10.0:
+            logger.warning(
+                f"[A2] Input x out of expected range: min={x_min:.3f}, max={x_max:.3f}. "
+                f"Expected dequantized+logit-transformed input in ~[-5,5]. "
+                f"Check upstream preprocessing (raw [0,1] or [0,255] will cause NaN)."
+            )
         
         # Conditioning
         if compute_h:
@@ -420,6 +453,24 @@ class ConditionalRealNVP(nn.Module):
             raise ValueError(f"Expected 2 factored variables, got {len(z_factored_list)}")
         
         h = self.conditioner(y)
+        
+        # [F3] Clamp conditioning vector to prevent scale network explosion in inverse
+        h_pre_clamp_norm = h.norm().item()
+        h = torch.clamp(h, -10.0, 10.0)
+        if abs(h.norm().item() - h_pre_clamp_norm) > 1e-3:
+            logger.warning(
+                f"[F3] h clamped in inverse(): pre={h_pre_clamp_norm:.4f}, "
+                f"post={h.norm().item():.4f}. Check MNISTConditioner output scale."
+            )
+        
+        # [A3] Log h.norm() stats for first 50 calls to monitor conditioning stability
+        if self._h_log_count < 50:
+            logger.info(
+                f"[A3] inverse() h stats (call {self._h_log_count + 1}/50): "
+                f"norm={h.norm().item():.4f}, mean={h.mean().item():.4f}, "
+                f"std={h.std().item():.4f}, max_abs={h.abs().max().item():.4f}"
+            )
+            self._h_log_count += 1
         
         try:
             x = z.clone()
