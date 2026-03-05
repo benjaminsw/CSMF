@@ -492,7 +492,28 @@ class ConditionalRealNVP(nn.Module):
                 "inverse() received empty z_factored_list; sampling missing "
                 "factored latents from N(0, I)."
             )
-            B, _, _, _ = z.shape
+            # EXP-SANITY may pass flattened base samples (e.g. [B, 784]) instead of
+            # image-latent z_final ([B, 4, 7, 7]). Coerce to expected shape so
+            # fallback sampling can continue.
+            if z.dim() != 4:
+                B = z.shape[0]
+                z_flat = z.reshape(B, -1)
+                z_final_dim = 4 * 7 * 7
+                if z_flat.shape[1] < z_final_dim:
+                    raise ValueError(
+                        f"inverse() expected at least {z_final_dim} latent dims for z_final, "
+                        f"got {z_flat.shape[1]}"
+                    )
+                if z_flat.shape[1] != z_final_dim:
+                    logger.warning(
+                        "inverse() received non-image z with %d dims; using first %d dims "
+                        "as z_final and sampling factored latents.",
+                        z_flat.shape[1],
+                        z_final_dim,
+                    )
+                z = z_flat[:, :z_final_dim].reshape(B, 4, 7, 7)
+
+            B = z.shape[0]
             z_factor1 = torch.randn(B, 2, 14, 14, device=z.device, dtype=z.dtype)
             z_factor2 = torch.randn(B, 4, 7, 7, device=z.device, dtype=z.dtype)
             z_factored_list = [z_factor1, z_factor2]
