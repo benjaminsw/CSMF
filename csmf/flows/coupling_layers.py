@@ -1,20 +1,41 @@
 """
 Conditional Affine Coupling Layers for CSMF
 
-Version: WP0.2-Coupling-v1.3
-Last Modified: 2025-02-04
+Version: WP0.2-Coupling-v1.7.0
+Last Modified: 2026-03-05
 Changelog:
+  v1.7.0 (2026-03-05): [F] Added softclamp on shift t (t_max=5.0) — unconstrained t was exploding
+                        exponentially through 9 coupling layers (|ΔB| reached 121,678 at scale3_coup3),
+                        overwhelming later scales and preventing s from learning. Same softclamp
+                        formula as s: t_max * t_raw / sqrt(1 + t_raw²). Bounded t prevents cascade.
+  v1.6.0 (2026-03-05): [F] scale_net output layer changed from zero-init to Xavier gain=0.01 —
+                        zero weights blocked all gradient flow (∂loss/∂hidden = ... × W_out = 0),
+                        making s permanently stuck at 0 and log_det constant. Small random init
+                        allows gradients to flow while keeping s ≈ 0 at start. Shift_net stays
+                        zero-init (t is added not multiplied, so gradients flow regardless).
+  v1.5.0 (2026-03-05): [F] Replaced tanh with softclamp for scale clamping — tanh saturated to ±1
+                        for all inputs, producing constant log_det (diagnosed by DIAG-RNVP-v1.1.0).
+                        Softclamp: s_max * s_raw / sqrt(1 + s_raw²) has same bounded range but
+                        gradient never fully vanishes. Reverted v1.5.0-beta Xavier init (no effect).
+  v1.4.1 (2026-02-26): BUG FIX — zero-init output layers of scale and shift nets;
+                       s=0, t=0 at init → exp(s)=1 → identity transform on first pass,
+                       prevents z explosion across 9 coupling layers;
+                       s_max default corrected 3.0→2.0 to match spec and RealNVP caller
+  v1.4 (2026-02-24): [R1] Replaced inline γ/β MLPs with shared FiLM module (film.py);
+                     gains identity init, scale_factor=5.0 tuning, NaN/Inf guards, spatial h
+                     support from canonical FiLM implementation; _apply_film() simplified to
+                     single FiLM.__call__(); removed unused networkx import.
   v1.3 (2025-02-04): Added comprehensive FiLM and s/t debug logging for conditioning diagnosis
   v1.2 (2025-02-04): Added mask debugging for extraction, reconstruction, inverse consistency
   v1.1 (2025-10-25): Added batch normalization and explicit masking support
   v1.0 (2025-10-25): Initial conditional coupling with FiLM modulation
-Dependencies: torch>=2.0
+Dependencies: torch>=2.0, film.py WP0.1-FiLM-v1.0+
 """
 
-from networkx import reverse
 import torch
 import torch.nn as nn
 import logging
+from csmf.conditioning.film import FiLM  # [R1] v1.4 — shared FiLM module
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -36,7 +57,7 @@ class ConditionalAffineCoupling(nn.Module):
     [v1.1.0] Supports explicit binary masks for spatial/channel partitioning
     """
     
-    def __init__(self, dim, split_dim, h_dim, hidden_dims=[256, 256], s_max=3.0,
+    def __init__(self, dim, split_dim, h_dim, hidden_dims=[256, 256], s_max=0.5, t_max=5.0,
                  use_batch_norm=True, bn_momentum=0.9, mask=None, debug=False):
         """
         Initialize conditional affine coupling layer.
@@ -47,6 +68,7 @@ class ConditionalAffineCoupling(nn.Module):
             h_dim (int): Dimension of conditioning features h
             hidden_dims (list[int]): Hidden layer sizes
             s_max (float): Scale clamping parameter for stability
+            t_max (float): Shift clamping parameter for stability [v1.7.0]
             use_batch_norm (bool): Enable batch normalization [v1.1.0]
             bn_momentum (float): Batch norm momentum [v1.1.0]
             mask (Tensor, optional): Binary mask [B, dim] or [dim] for partitioning [v1.1.0]
@@ -74,6 +96,7 @@ class ConditionalAffineCoupling(nn.Module):
         self.h_dim = h_dim
         self.hidden_dims = hidden_dims
         self.s_max = s_max
+        self.t_max = t_max
         self.use_batch_norm = use_batch_norm
         self.debug = debug  # [v1.3.0]
         
@@ -153,42 +176,36 @@ class ConditionalAffineCoupling(nn.Module):
         
 
         # Build scale network s(x_A; h)
+        # [v1.6.0] Small random init (Xavier gain=0.01) instead of zero — zero weights block
+        # all gradient flow through output layer, making s permanently 0.
         self.scale_net = self._build_net(
             in_dim=in_dim_for_nets,
             out_dim=out_dim_for_nets,
-            hidden_dims=hidden_dims
+            hidden_dims=hidden_dims,
+            small_init_output=0.01
         )
 
-        # Build shift network t(x_A; h)
+        # Build shift network t(x_A; h) — zero-init output so t=0 at init → identity
         self.shift_net = self._build_net(
             in_dim=in_dim_for_nets,
             out_dim=out_dim_for_nets,
-            hidden_dims=hidden_dims
+            hidden_dims=hidden_dims,
+            zero_init_output=True
         )
 
 
     
         
-        # Create FiLM layers (gamma and beta MLPs) for each hidden layer
-        self.film_layers = nn.ModuleList()
-        for hidden_dim in hidden_dims:
-            gamma_mlp = nn.Sequential(
-                nn.Linear(h_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim)
-            )
-            beta_mlp = nn.Sequential(
-                nn.Linear(h_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim)
-            )
-            self.film_layers.append(nn.ModuleDict({
-                'gamma': gamma_mlp,
-                'beta': beta_mlp
-            }))
+        # [R1] v1.4 — Use shared FiLM module (film.py) instead of inline γ/β MLPs.
+        # Gains: identity init, scale_factor=5.0, NaN/Inf guards, spatial h support.
+        # One FiLM instance per hidden layer (same structure as before, cleaner impl).
+        self.film_layers = nn.ModuleList([
+            FiLM(f_dim=hidden_dim, h_dim=h_dim)
+            for hidden_dim in hidden_dims
+        ])
         
-        logger.info(f"Initialized ConditionalAffineCoupling v1.3.0: dim={dim}, split_dim={split_dim}, "
-                   f"h_dim={h_dim}, hidden_dims={hidden_dims}, s_max={s_max}, "
+        logger.info(f"Initialized ConditionalAffineCoupling v1.7.0: dim={dim}, split_dim={split_dim}, "
+                   f"h_dim={h_dim}, hidden_dims={hidden_dims}, s_max={s_max}, t_max={t_max}, "
                    f"use_batch_norm={use_batch_norm}, mask={'custom' if mask is not None else 'split-based'}, "
                    f"debug={debug}")
     
@@ -317,15 +334,23 @@ class ConditionalAffineCoupling(nn.Module):
         
         s = self._forward_net(self.scale_net, x_A_input, h, net_type='scale')
         
-        # Clamp scale for stability: s = tanh(s) * s_max
+        # Clamp scale for stability: s = softclamp(s_raw) * s_max
+        # [v1.5.0] Replaced tanh with softclamp — tanh saturates to ±1 for large inputs,
+        # making s = ±s_max constant across all samples → constant log_det.
+        # Softclamp: s_max * s_raw / sqrt(1 + s_raw²) has same bounded range [-s_max, s_max]
+        # but gradient never fully vanishes (∂/∂s_raw → 0 only as s_raw → ∞, vs tanh → 0 at ~±3).
         s_unclamped = s.clone() if self.debug else None
-        s = torch.tanh(s) * self.s_max
+        s = self.s_max * s / torch.sqrt(1.0 + s ** 2)
         
         if self.debug:
             logger.debug(f"  Computing shift t(x_A; h)...")
         
         # Compute shift parameters t(x_A; h) with FiLM
         t = self._forward_net(self.shift_net, x_A_input, h, net_type='shift')
+        
+        # [v1.7.0] Softclamp shift to prevent exponential explosion across layers.
+        # Same formula as scale: bounded range [-t_max, t_max], gradient never fully vanishes.
+        t = self.t_max * t / torch.sqrt(1.0 + t ** 2)
         
 
                 
@@ -447,8 +472,18 @@ class ConditionalAffineCoupling(nn.Module):
         x_denorm = (x - beta) * torch.sqrt(running_var + eps) / gamma + running_mean
         return x_denorm
     
-    def _build_net(self, in_dim, out_dim, hidden_dims):
-        """Build scale or shift network with FiLM insertion points."""
+    def _build_net(self, in_dim, out_dim, hidden_dims, zero_init_output=False,
+                   small_init_output=None):
+        """Build scale or shift network with FiLM insertion points.
+        
+        Args:
+            zero_init_output: If True, zero-initialise the final Linear layer
+                              (weight and bias). Use for shift net so t=0 at init.
+            small_init_output: If set (e.g. 0.01), apply Xavier uniform with this
+                              gain to the output layer weight, zero bias. Use for
+                              scale net so s ≈ 0 at init but gradients can flow.
+                              Takes precedence over zero_init_output if both set.
+        """
         if len(hidden_dims) < 1:
             error_msg = f"hidden_dims must have at least 1 element, got {len(hidden_dims)}"
             logger.error(error_msg)
@@ -462,7 +497,16 @@ class ConditionalAffineCoupling(nn.Module):
             layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
             layers.append(nn.ReLU())
         
-        layers.append(nn.Linear(hidden_dims[-1], out_dim))
+        last_linear = nn.Linear(hidden_dims[-1], out_dim)
+        if small_init_output is not None:
+            nn.init.xavier_uniform_(last_linear.weight, gain=small_init_output)
+            nn.init.zeros_(last_linear.bias)
+            logger.debug(f"_build_net: small-init output layer gain={small_init_output} ({hidden_dims[-1]}→{out_dim})")
+        elif zero_init_output:
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
+            logger.debug(f"_build_net: zero-initialised output layer ({hidden_dims[-1]}→{out_dim})")
+        layers.append(last_linear)
         return layers
     
     def _forward_net(self, net, x_A, h, net_type='scale'):
@@ -490,30 +534,26 @@ class ConditionalAffineCoupling(nn.Module):
         return features
     
     def _apply_film(self, features, h, layer_idx):
-        """Apply FiLM modulation at specific layer."""
+        """Apply FiLM modulation at specific layer.
+        [R1] v1.4 — Delegates to shared FiLM module (film.py).
+        NaN/Inf guards, identity init, and debug checks handled by FiLM internally.
+        """
         if layer_idx >= len(self.film_layers):
             error_msg = f"layer_idx={layer_idx} out of bounds, have {len(self.film_layers)} FiLM layers"
             logger.error(error_msg)
             raise IndexError(error_msg)
-        
-        gamma_mlp = self.film_layers[layer_idx]['gamma']
-        beta_mlp = self.film_layers[layer_idx]['beta']
-        
-        gamma = gamma_mlp(h)
-        beta = beta_mlp(h)
-        
-        # [v1.3 DEBUG] Log FiLM parameters and effect
+
+        # [v1.3 DEBUG] Log pre-FiLM state
         if self.debug:
             features_before = features.clone()
             logger.debug(f"      [FiLM Layer {layer_idx}]")
             logger.debug(f"        h: norm={h.norm().item():.6f}")
-            logger.debug(f"        gamma: norm={gamma.norm().item():.6f}, range=[{gamma.min().item():.4f}, {gamma.max().item():.4f}]")
-            logger.debug(f"        beta: norm={beta.norm().item():.6f}, range=[{beta.min().item():.4f}, {beta.max().item():.4f}]")
             logger.debug(f"        features (before): norm={features_before.norm().item():.6f}")
-        
-        out = gamma * features + beta
-        
-        # [v1.3 DEBUG] Log effect of FiLM
+
+        # [R1] v1.4 — Single call to shared FiLM module
+        out = self.film_layers[layer_idx](features, h)
+
+        # [v1.3 DEBUG] Log post-FiLM state
         if self.debug:
             logger.debug(f"        features (after):  norm={out.norm().item():.6f}")
             feature_change = (out - features_before).norm().item()
@@ -522,7 +562,7 @@ class ConditionalAffineCoupling(nn.Module):
             logger.debug(f"        FiLM effect: abs_change={feature_change:.6f}, relative={relative_change:.4f}")
             if relative_change < 0.01:
                 logger.warning(f"        ⚠️  FiLM has minimal effect (relative change < 1%)")
-        
+
         return out
 
 

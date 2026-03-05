@@ -1,10 +1,20 @@
 """
 ConditionalRealNVP for MNIST Inverse Problems - Multi-Scale Architecture
 
-Version: WP0.3-CondRNVP-v2.1.1
+Version: WP0.3-CondRNVP-v2.1.6
 Abbr: COND-RNVP
-Last Modified: 2026-02-22
+Last Modified: 2026-02-28
 Changelog:
+  v2.1.6 (2026-02-28): Rate-limited batch size mismatch warning in inverse() — was flooding
+                        logs every epoch during sampling; added _warn_batch counter; warning
+                        now logged only once per instance
+  v2.1.5 (2026-02-28): Rate-limited recompute warning — added _warn_no_h counter; logged once
+  v2.1.3 (2026-02-26): [B] Spec-compliant h caching — forward/inverse accept optional h=
+  v2.1.2 (2026-02-26): BUG FIX — removed [F2] z_flat clamp (-50,50) in ScaleBlock inverse;
+                        clamp corrupted the coupling unchanged half (mask side) causing inv_err=6.91;
+                        replaced with NaN/Inf-only guard (nan_to_num, no value clamping);
+                        removed [F3] h clamp (-10,10) in inverse() — same root cause, corrupts
+                        s,t recomputation; [F2]/[F3] were treating symptoms not root cause (fixed in COND-COUP v1.4.1)
   v2.1.1 (2026-02-22): [F1] Reduced s_max 10.0→2.0 to prevent exp() explosion across 9 coupling layers;
                         [F2] Added z_flat clamping (-50,50) before inverse coupling loop in ScaleBlock;
                         [F3] Added h clamping (-10,10) after conditioner call in inverse();
@@ -67,7 +77,7 @@ class ScaleBlock(nn.Module):
                 h_dim=h_dim,
                 hidden_dims=hidden_dims,
                 use_batch_norm=False,  # Disable BN for debugging
-                s_max=2.0,  # [F1] Reduced from 10.0: exp(10)≈22026 explodes across 9 layers
+                s_max=0.5,  # [F1] Reduced from 10.0: exp(10)≈22026 explodes across 9 layers
                 debug=self.debug
             )
             self.coupling_layers.append(layer)
@@ -161,12 +171,15 @@ class ScaleBlock(nn.Module):
             # Re-flatten with correct shape
             z_flat = z_out.reshape(B, -1)
             
-            # [F2] Clamp activations before inverse coupling to prevent NaN from accumulated scale explosion
-            z_flat_pre_clamp = z_flat
-            z_flat = torch.clamp(z_flat, -50.0, 50.0)
-            if torch.any(z_flat != z_flat_pre_clamp):
-                n_clamped = (z_flat != z_flat_pre_clamp).sum().item()
-                logger.warning(f"[F2] Clamped {n_clamped} values in z_flat before inverse coupling (ScaleBlock)")
+            # NaN/Inf guard only — do NOT clamp values (clamping corrupts the
+            # coupling's unchanged half and breaks mathematical invertibility)
+            if torch.any(torch.isnan(z_flat)) or torch.any(torch.isinf(z_flat)):
+                n_bad = (torch.isnan(z_flat) | torch.isinf(z_flat)).sum().item()
+                logger.error(
+                    f"[ScaleBlock inverse] NaN/Inf in z_flat before coupling ({n_bad} values). "
+                    f"Check scale net init and s_max. Replacing with zeros."
+                )
+                z_flat = torch.nan_to_num(z_flat, nan=0.0, posinf=0.0, neginf=0.0)
             
             if self.debug:
                 logger.debug(f"  Flattened for coupling: shape={z_flat.shape}")
@@ -244,7 +257,9 @@ class ConditionalRealNVP(nn.Module):
         self.config = config
         self._cached_h = None
         self.debug = debug
-        self._h_log_count = 0  # [A3] Counter for h.norm() logging during first 50 batches
+        self._h_log_count  = 0  # [A3] Counter for h.norm() logging during first 50 batches
+        self._warn_no_h    = 0  # [v2.1.5] Counter to suppress repeated recompute warnings
+        self._warn_batch   = 0  # [v2.1.6] Counter to suppress batch size mismatch warnings
         
         logger.info(f"Initializing ConditionalRealNVP v2.1.0: h_dim={h_dim}, debug={debug}")
         
@@ -287,9 +302,17 @@ class ConditionalRealNVP(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        compute_h: bool = True
+        compute_h: bool = True,
+        h: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Forward transform with debugging."""
+        """Forward transform with debugging.
+        
+        Args:
+            h: Pre-computed conditioning vector from external conditioner (e.g. CSMF's
+               shared MNISTConditioner). If provided, skips internal self.conditioner(y)
+               entirely — satisfies WP0 spec "cache h per mini-batch" requirement.
+               If None, falls back to self.conditioner(y) for standalone use.
+        """
         
         # Validation
         if x.ndim != 4:
@@ -312,16 +335,24 @@ class ConditionalRealNVP(nn.Module):
                 f"Check upstream preprocessing (raw [0,1] or [0,255] will cause NaN)."
             )
         
-        # Conditioning
-        if compute_h:
+        # Conditioning — use external h if provided (spec-compliant caching path)
+        if h is not None:
+            # [B] External h from CSMF's shared conditioner — no recomputation
+            self._cached_h = h
+            if self.debug:
+                logger.debug(f"  Conditioning h: source=external, shape={h.shape}, norm={h.norm().item():.6f}")
+        elif compute_h:
             h = self.conditioner(y)
             self._cached_h = h
             if self.debug:
-                logger.debug(f"  Conditioning h: shape={h.shape}, norm={h.norm().item():.6f}")
+                logger.debug(f"  Conditioning h: source=internal, shape={h.shape}, norm={h.norm().item():.6f}")
         else:
             if self._cached_h is None:
-                raise RuntimeError("No cached h")
+                logger.error("forward(): compute_h=False but no cached h and no external h provided")
+                raise RuntimeError("No cached h — pass h= or set compute_h=True")
             h = self._cached_h
+            if self.debug:
+                logger.debug(f"  Conditioning h: source=cached, shape={h.shape}, norm={h.norm().item():.6f}")
         
         B = x.shape[0]
         log_det_total = torch.zeros(B, device=x.device)
@@ -439,9 +470,16 @@ class ConditionalRealNVP(nn.Module):
         self,
         z: torch.Tensor,
         z_factored_list: List[torch.Tensor],
-        y: torch.Tensor
+        y: torch.Tensor,
+        h: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Inverse transform with debugging."""
+        """Inverse transform with debugging.
+        
+        Args:
+            h: Pre-computed conditioning vector from external conditioner. If provided,
+               uses it directly — same h as forward pass → mathematically correct inverse.
+               Fallback chain: external h → cached h → recompute (logs WARNING).
+        """
         
         if self.debug:
             logger.debug("=" * 70)
@@ -452,22 +490,42 @@ class ConditionalRealNVP(nn.Module):
         if len(z_factored_list) != 2:
             raise ValueError(f"Expected 2 factored variables, got {len(z_factored_list)}")
         
-        h = self.conditioner(y)
+        # h resolution: external → cached → recompute (fallback with WARNING)
+        if h is not None:
+            h_source = "external"
+        elif self._cached_h is not None:
+            # [v2.1.4] Validate batch size — sampling uses batch=1 but cache may be from
+            # training batch=128; stale h causes coupling cat([x_A, x_B_out]) size mismatch
+            if self._cached_h.shape[0] != z.shape[0]:
+                if not hasattr(self, '_warn_batch') or self._warn_batch < 1:
+                    logger.warning(
+                        f"inverse(): cached h batch size {self._cached_h.shape[0]} != "
+                        f"z batch size {z.shape[0]} — clearing cache, recomputing from y "
+                        f"(warning suppressed after this)"
+                    )
+                    self._warn_batch = getattr(self, '_warn_batch', 0) + 1
+                self._cached_h = None
+                h = self.conditioner(y)
+                h_source = "recomputed"
+            else:
+                h = self._cached_h
+                h_source = "cached"
+        else:
+            if self._warn_no_h < 1:
+                logger.warning(
+                    "inverse(): no external h and no cached h — recomputing from self.conditioner(y). "
+                    "This may cause forward/inverse h mismatch. Pass h= from CSMF's conditioner. "
+                    "(this warning is suppressed after first occurrence)"
+                )
+                self._warn_no_h += 1
+            h = self.conditioner(y)
+            h_source = "recomputed"
         
-        # [F3] Clamp conditioning vector to prevent scale network explosion in inverse
-        h_pre_clamp_norm = h.norm().item()
-        h = torch.clamp(h, -10.0, 10.0)
-        if abs(h.norm().item() - h_pre_clamp_norm) > 1e-3:
-            logger.warning(
-                f"[F3] h clamped in inverse(): pre={h_pre_clamp_norm:.4f}, "
-                f"post={h.norm().item():.4f}. Check MNISTConditioner output scale."
-            )
-        
-        # [A3] Log h.norm() stats for first 50 calls to monitor conditioning stability
+        # [A3] Log h.norm() stats for first 50 calls — includes source for mismatch diagnosis
         if self._h_log_count < 50:
             logger.info(
                 f"[A3] inverse() h stats (call {self._h_log_count + 1}/50): "
-                f"norm={h.norm().item():.4f}, mean={h.mean().item():.4f}, "
+                f"source={h_source}, norm={h.norm().item():.4f}, mean={h.mean().item():.4f}, "
                 f"std={h.std().item():.4f}, max_abs={h.abs().max().item():.4f}"
             )
             self._h_log_count += 1
