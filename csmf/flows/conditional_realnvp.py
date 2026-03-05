@@ -486,8 +486,25 @@ class ConditionalRealNVP(nn.Module):
             logger.debug("[REALNVP INVERSE]")
             logger.debug(f"  Input z: shape={z.shape}")
         
-        # Validation
-        if len(z_factored_list) != 2:
+        # Validation / graceful fallback for callers that provide only z_final.
+        if len(z_factored_list) == 0:
+            logger.warning(
+                "inverse() received empty z_factored_list; sampling missing "
+                "factored latents from N(0, I)."
+            )
+            B, _, _, _ = z.shape
+            z_factor1 = torch.randn(B, 2, 14, 14, device=z.device, dtype=z.dtype)
+            z_factor2 = torch.randn(B, 4, 7, 7, device=z.device, dtype=z.dtype)
+            z_factored_list = [z_factor1, z_factor2]
+        elif len(z_factored_list) == 1:
+            logger.warning(
+                "inverse() received one factored latent; sampling the second "
+                "missing latent from N(0, I)."
+            )
+            B = z.shape[0]
+            z_factor2 = torch.randn(B, 4, 7, 7, device=z.device, dtype=z.dtype)
+            z_factored_list = [z_factored_list[0], z_factor2]
+        elif len(z_factored_list) != 2:
             raise ValueError(f"Expected 2 factored variables, got {len(z_factored_list)}")
         
         # h resolution: external → cached → recompute (fallback with WARNING)
