@@ -1,10 +1,25 @@
 """
 ConditionalRealNVP for MNIST Inverse Problems - Multi-Scale Architecture
 
-Version: WP0.3-CondRNVP-v2.1.6
+Version: WP0.3-CondRNVP-v2.3.0
 Abbr: COND-RNVP
-Last Modified: 2026-02-28
+Last Modified: 2026-03-08
 Changelog:
+  v2.3.0 (2026-03-08): [A] ActNorm intra-block (Pattern A) — one ActNorm per coupling layer
+                        in each ScaleBlock; applied immediately after each coupling before
+                        permutation: coupling_i → ActNorm_i → perm_{i+1}; stabilizes signal
+                        scale during training so each subsequent coupling receives better-
+                        conditioned input; log_det from ActNorm tracked and added to total;
+                        inverse loop applies ActNorm in reverse after inv_perm.
+  v2.2.0 (2026-03-08): [F1] Alternating split_dim in ScaleBlock — even layers use first-half
+                        as conditioner, odd layers use second-half; every dimension is now
+                        transformed at least once per block, fixing the NLL plateau (~-150)
+                        caused by xA being a permanent dead zone across all layers.
+                        [F2] Fixed random permutations between coupling layers — one randperm
+                        buffer registered per inter-layer gap (perm_i / inv_perm_i for i>0);
+                        applied before each coupling in forward, inverted after in reverse;
+                        breaks axis-aligned structure that caused RealNVP-NSF correlation
+                        (ρ=0.794) and improves mixture diversity.
   v2.1.6 (2026-02-28): Rate-limited batch size mismatch warning in inverse() — was flooding
                         logs every epoch during sampling; added _warn_batch counter; warning
                         now logged only once per instance
@@ -35,7 +50,7 @@ import logging
 try:
     from configs.mnist_config import MNIST_CONFIG
     from csmf.conditioning.conditioning_networks import MNISTConditioner
-    from csmf.flows.coupling_layers import ConditionalAffineCoupling
+    from csmf.flows.coupling_layers import ConditionalAffineCoupling, ActNorm
 except ImportError as e:
     logging.error(f"Failed to import dependencies: {e}")
     raise
@@ -68,21 +83,37 @@ class ScaleBlock(nn.Module):
         # Create coupling layers
         dim = channels * spatial_dim * spatial_dim
         self.coupling_layers = nn.ModuleList()
-        
+
         for i in range(n_layers):
-            split_dim = dim // 2
+            # [F1] v2.2.0 — Alternating split: even layers condition first-half→second-half,
+            # odd layers condition second-half→first-half. Ensures every dimension is
+            # transformed at least once per block (xA was a permanent dead zone before).
+            split_dim = dim // 2 if i % 2 == 0 else dim - dim // 2
             layer = ConditionalAffineCoupling(
                 dim=dim,
                 split_dim=split_dim,
                 h_dim=h_dim,
                 hidden_dims=hidden_dims,
-                use_batch_norm=False,  # Disable BN for debugging
-                s_max=0.5,  # [F1] Reduced from 10.0: exp(10)≈22026 explodes across 9 layers
+                use_batch_norm=False,
+                s_max=0.65,
                 debug=self.debug
             )
             self.coupling_layers.append(layer)
+
+            # [F2] v2.2.0 — Register fixed random permutation for inter-layer gaps (i > 0).
+            # Applied before coupling_i in forward; inverted after in reverse.
+            # Breaks axis-aligned structure that causes RealNVP-NSF correlation (ρ=0.794).
+            if i > 0:
+                perm = torch.randperm(dim)
+                inv_perm = torch.argsort(perm)
+                self.register_buffer(f'perm_{i}', perm)
+                self.register_buffer(f'inv_perm_{i}', inv_perm)
+
             if self.debug:
                 logger.debug(f"ScaleBlock: layer {i+1}/{n_layers}, dim={dim}, split={split_dim}")
+
+        # [A] v2.3.0 — One ActNorm per coupling layer for intra-block signal stabilization
+        self.actnorms = nn.ModuleList([ActNorm(dim) for _ in range(n_layers)])
     
     def forward(
         self,
@@ -108,19 +139,28 @@ class ScaleBlock(nn.Module):
         z_flat = z.reshape(B, -1)
         
         if not reverse:
-            # ========== FORWARD: coupling → squeeze ==========
+            # ========== FORWARD: coupling → ActNorm → permutation ==========
             for i, coupling in enumerate(self.coupling_layers):
+                # [F2] v2.2.0 — Apply permutation before each coupling (except first)
+                if i > 0:
+                    perm = getattr(self, f'perm_{i}')
+                    z_flat = z_flat[:, perm]
+
                 if self.debug:
                     z_before = z_flat.clone()
-                
+
                 z_flat, ld = coupling.forward(z_flat, h, reverse=False)
                 log_det = log_det + ld
-                
+
+                # [A] v2.3.0 — ActNorm after coupling, before next permutation
+                z_flat, ld_an = self.actnorms[i].forward(z_flat, reverse=False)
+                log_det = log_det + ld_an
+
                 if self.debug:
                     logger.debug(f"  Coupling {i+1}/{self.n_layers}:")
                     logger.debug(f"    Output norm: {z_flat.norm().item():.6f}")
                     logger.debug(f"    Log-det: mean={ld.mean().item():.4f}, sum={log_det.mean().item():.4f}")
-                    
+
                     # Per-layer invertibility check
                     z_test_inv, _ = coupling.forward(z_flat, h, reverse=True)
                     inv_err = (z_before - z_test_inv).abs().max().item()
@@ -186,6 +226,17 @@ class ScaleBlock(nn.Module):
             
             # Apply couplings in reverse order
             for i, coupling in enumerate(reversed(self.coupling_layers)):
+                layer_idx = self.n_layers - 1 - i
+
+                # [F2] v2.2.0 — Undo permutation after inverse coupling (layer_idx > 0)
+                if layer_idx > 0:
+                    inv_perm = getattr(self, f'inv_perm_{layer_idx}')
+                    z_flat = z_flat[:, inv_perm]
+
+                # [A] v2.3.0 — ActNorm inverse before coupling inverse (mirrors forward order)
+                z_flat, ld_an = self.actnorms[layer_idx].forward(z_flat, reverse=True)
+                log_det = log_det + ld_an
+
                 z_flat, ld = coupling.forward(z_flat, h, reverse=True)
                 log_det = log_det + ld
                 
