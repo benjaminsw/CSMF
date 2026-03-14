@@ -37,9 +37,3 @@ docs/
 # Results
 results/
 *test_results.txt
-
-# data
-data/
-
-# checkpoints
-checkpoints/

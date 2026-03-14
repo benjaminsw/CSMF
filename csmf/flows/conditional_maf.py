@@ -1,12 +1,21 @@
 """
 Conditional Masked Autoregressive Flow (Full MADE Implementation)
 
-Version: WP0.3-CondMAF-v2.0
+Version: WP0.3-CondMAF-v2.2
 Abbr: COND-MAF
-Last Modified: 2025-12-09
+Last Modified: 2026-02-27
 Changelog:
-  v1.0 (2025-10-25): Initial sequential autoregressive implementation
+  v2.2 (2026-02-27): [SPEED] Default n_flows reduced 4→2 (~2× faster forward+inverse);
+                     default hidden_dims reduced [256,256]→[128,128] (~1.5–2× faster forward);
+                     changes are defaults only — callers can still override; version tracking
+                     updated to v2.2; trade-offs: weaker density, less expressive MADE
+  v2.1 (2026-02-26): [B] Spec-compliant h caching — forward() and inverse() accept optional
+                     h=Optional[Tensor] from CSMF's shared conditioner; forward/inverse use
+                     identical h eliminating recompute mismatch; inverse() fallback chain:
+                     external→cached→recompute (WARNING on recompute); _cached_h added to
+                     __init__; aligns with COND-RNVP v2.1.3 Option B treatment
   v2.0 (2025-10-25): Full MADE masking with parallel computation
+  v1.0 (2025-10-25): Initial sequential autoregressive implementation
 Dependencies: torch>=2.0, conditioning_networks WP0.1-CondNet-v1.1+, film WP0.1-FiLM-v1.0+
 
 Purpose: Full MADE implementation with parallel computation for MNIST inverse problems
@@ -371,7 +380,7 @@ class ConditionalMAF(nn.Module):
         dim: int = 784,
         h_dim: int = 64,
         cond_dim: int = None,
-        n_flows: int = 4,
+        n_flows: int = 2,
         hidden_dims: List[int] = None,
         use_batch_norm: bool = True,
         use_reverse_order: bool = True,
@@ -396,8 +405,8 @@ class ConditionalMAF(nn.Module):
             h_dim = cond_dim
         
         # Version tracking
-        self.version = "W0.1-MAF-v2.0"
-        self.abbr = "W0.1-MAF-MADE"
+        self.version = "WP0.3-CondMAF-v2.2"
+        self.abbr = "COND-MAF-SPEED"
         logger.info(f"Initializing {self.__class__.__name__} version {self.version}")
         
         # Use config if provided
@@ -409,7 +418,7 @@ class ConditionalMAF(nn.Module):
             hidden_dims = maf_config.get('hidden_dims', hidden_dims)
         
         if hidden_dims is None:
-            hidden_dims = [256, 256]
+            hidden_dims = [128, 128]
         
         self.dim = dim
         self.h_dim = h_dim
@@ -425,6 +434,8 @@ class ConditionalMAF(nn.Module):
         except Exception as e:
             logger.error(f"Failed to create MNISTConditioner: {e}")
             raise
+        
+        self._cached_h: Optional[torch.Tensor] = None  # [B] v2.1 — external h cache
         
         # Create orderings for each flow (alternating between default and reversed)
         self.orderings = []
@@ -491,7 +502,7 @@ class ConditionalMAF(nn.Module):
         """Apply inverse permutation to restore original order."""
         return x[:, inv_ordering]
     
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, h: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass: transform data x to latent z (PARALLEL COMPUTATION).
         
@@ -500,7 +511,10 @@ class ConditionalMAF(nn.Module):
         Args:
             x: Data tensor, shape (batch, dim)
             y: Measurements for conditioning, shape (batch, 1, 28, 28)
-            
+            h: Pre-computed conditioning vector from external conditioner (e.g. CSMF's
+               shared MNISTConditioner). If provided, skips internal self.conditioner(y)
+               — satisfies WP0 spec "cache h per mini-batch" requirement.
+               
         Returns:
             z: Latent codes, shape (batch, dim)
             log_det_total: Total log determinant, shape (batch,)
@@ -512,9 +526,15 @@ class ConditionalMAF(nn.Module):
             logger.error(f"Input dimension mismatch: expected {self.dim}, got {x.shape[1]}")
             raise ValueError(f"Input shape {x.shape} doesn't match expected dim {self.dim}")
         
-        # Extract conditioning features ONCE (shared across all flows)
+        # [B] v2.1 — h resolution: external → internal conditioner
         try:
-            h = self.conditioner(y)
+            if h is not None:
+                self._cached_h = h
+                logger.debug(f"MAF forward: using external h, norm={h.norm().item():.4f}")
+            else:
+                h = self.conditioner(y)
+                self._cached_h = h
+                logger.debug(f"MAF forward: computed internal h, norm={h.norm().item():.4f}")
             if torch.isnan(h).any():
                 logger.error("NaN detected in conditioning features")
                 raise RuntimeError("NaN in conditioning features")
@@ -577,7 +597,7 @@ class ConditionalMAF(nn.Module):
         
         return z, log_det_total, log_prob
     
-    def inverse(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def inverse(self, z: torch.Tensor, y: torch.Tensor, h: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Inverse pass: transform latent z back to data x.
         
@@ -588,15 +608,30 @@ class ConditionalMAF(nn.Module):
         Args:
             z: Latent codes, shape (batch, dim)
             y: Measurements for conditioning, shape (batch, 1, 28, 28)
+            h: Pre-computed conditioning vector from external conditioner.
+               Fallback chain: external h → cached h → recompute (WARNING on recompute).
             
         Returns:
             x: Reconstructed data, shape (batch, dim)
         """
         batch_size = z.shape[0]
         
-        # Extract conditioning features
+        # [B] v2.1 — h resolution: external → cached → recompute (fallback with WARNING)
         try:
-            h = self.conditioner(y)
+            if h is not None:
+                h_source = "external"
+            elif self._cached_h is not None:
+                h = self._cached_h
+                h_source = "cached"
+            else:
+                logger.warning(
+                    "MAF inverse(): no external h and no cached h — recomputing from "
+                    "self.conditioner(y). This may cause forward/inverse h mismatch. "
+                    "Pass h= from CSMF's conditioner."
+                )
+                h = self.conditioner(y)
+                h_source = "recomputed"
+            logger.debug(f"MAF inverse: h source={h_source}, norm={h.norm().item():.4f}")
         except Exception as e:
             logger.error(f"Conditioning failed in inverse: {e}")
             raise
@@ -706,10 +741,10 @@ class ConditionalMAF(nn.Module):
 def get_version():
     """Return version information."""
     return {
-        'version': 'W0.1-MAF-v2.0',
-        'abbr': 'W0.1-MAF-MADE',
-        'date': '2025-10-25',
-        'purpose': 'Full MADE implementation with parallel computation',
+        'version': 'WP0.3-CondMAF-v2.2',
+        'abbr': 'COND-MAF-SPEED',
+        'date': '2026-02-27',
+        'purpose': 'Speed-optimised MAF: n_flows=2, hidden_dims=[128,128]',
         'improvements': [
             'MADE masking mechanism',
             'Parallel computation (O(D) forward)',

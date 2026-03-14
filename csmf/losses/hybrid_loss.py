@@ -1,13 +1,13 @@
-# =============================================================================
-# Version: WP2.1-HybridLoss-v1.1
+# Version: WP2.1-HybridLoss-v1.8
 # Abbr: HYBRID
 # File: csmf/losses/hybrid_loss.py
 # Description: Hybrid training objective for CSMF
 #              L = NLL + λ_cons·‖Ax−y‖² + λ_trans·SW2 + λ_cal·ES
-#              Includes three-stage training schedule (A/B/C),
-#              gate freeze/unfreeze logic, and checkpoint save/load.
-# Dependencies: torch, csmf.losses.sliced_wasserstein, csmf.losses.calibration
 # Changelog:
+#   v1.8 (2026-02-28): BUG FIX — x_sample [B,784] passed to SRForwardModel which requires
+#                      4D [B,1,28,28]; added x_sample_4d = x_sample.view(B,1,28,28) before
+#                      self.A.forward(); flat x_sample still used for SW2/ES calculations
+#   v1.7 (2026-02-28): BUG FIX — flow.sample() returns 2-tuple; fixed all 3 call sites
 #   v1.1 - Added three-stage training schedule (StageConfig + run_stage_A/B/C)
 #   v1.1 - Added gate freeze/unfreeze helpers (freeze_experts, unfreeze_last_blocks)
 #   v1.1 - Added checkpoint save/load per stage
@@ -120,7 +120,11 @@ class HybridLoss(nn.Module):
             loss:      scalar total loss
             loss_dict: dict with individual component values (detached)
         """
-        B, d = x_clean.shape
+        B = x_clean.shape[0]
+        # Do NOT flatten x_clean — CSMF handles per-expert flattening internally via
+        # _prepare_x_for_expert(). RealNVP needs [B,1,28,28]; MAF/NSF/NICE need [B,784].
+        # Only flatten here for SW2/ES shape calculations (d = flat dim).
+        d = x_clean.flatten(1).shape[1]   # 784 — used for SW2 ref_flat and energy_score only
 
         # Anneal weights
         lam_cons  = self._anneal(self.lambda_cons,  epoch, "cons")
@@ -128,30 +132,40 @@ class HybridLoss(nn.Module):
         lam_cal   = self._anneal(self.lambda_cal,   epoch, "cal")
 
         # ---- 1. NLL -------------------------------------------------------
-        h = flow.conditioner(y_degraded)                  # conditioning context
-        z, log_det = flow.forward(x_clean, h)             # encode clean samples
+        # CSMF.forward() returns (log_q [B,], log_q_experts [B,K])
+        # log_q is already the mixture log-probability log q(x|y) — use directly
+        log_q, _ = flow.forward(x_clean, y_degraded)
 
-        if torch.any(torch.isnan(log_det)) or torch.any(torch.isinf(log_det)):
+        if torch.any(torch.isnan(log_q)) or torch.any(torch.isinf(log_q)):
             logger.error(
-                "HybridLoss: NaN/Inf in log_det at epoch %d — "
+                "HybridLoss: NaN/Inf in log_q at epoch %d — "
                 "NaN count: %d, Inf count: %d",
                 epoch,
-                torch.isnan(log_det).sum().item(),
-                torch.isinf(log_det).sum().item(),
+                torch.isnan(log_q).sum().item(),
+                torch.isinf(log_q).sum().item(),
             )
-            raise RuntimeError("NaN/Inf in log_det — check flow numerical stability")
+            raise RuntimeError("NaN/Inf in log_q — check flow numerical stability")
 
-        log_q = flow.base_log_prob(z) + log_det           # log q(x|y) per sample
-        nll   = -log_q.mean()
+        nll = -log_q.mean()
 
         if torch.isnan(nll):
             logger.error("HybridLoss: NaN in NLL at epoch %d", epoch)
             raise RuntimeError("NaN in NLL loss")
 
         # ---- 2. Consistency: ‖A(x) − y‖² --------------------------------
-        x_sample = flow.sample(h, num_samples=1).squeeze(1)   # (B, d)
-        Ax = self.A.forward(x_sample)
-        consistency = torch.mean((Ax - y_degraded) ** 2)
+        # CSMF.sample() returns (x_samples [B,S,d], expert_ids [B,S]) — unpack first
+        if lam_cons > 0:
+            x_sample, _ = flow.sample(y_degraded, num_samples=1)
+            x_sample = x_sample.squeeze(1)
+            x_sample_4d = x_sample.view(B, 1, 28, 28)
+            Ax = self.A.forward(x_sample_4d)
+            consistency = torch.mean((Ax - y_degraded) ** 2)
+
+            if torch.isnan(consistency):
+                logger.error("HybridLoss: NaN in consistency at epoch %d", epoch)
+                raise RuntimeError("NaN in consistency loss")
+        else:
+            consistency = torch.tensor(0.0, device=x_clean.device)
 
         if torch.isnan(consistency):
             logger.error("HybridLoss: NaN in consistency at epoch %d", epoch)
@@ -159,9 +173,9 @@ class HybridLoss(nn.Module):
 
         # ---- 3. Transport: SW2(samples, x_clean) -------------------------
         if lam_trans > 0:
-            x_multi   = flow.sample(h, num_samples=self.n_sw2_samples)  # (B, S, d)
+            x_multi, _ = flow.sample(y_degraded, num_samples=self.n_sw2_samples)  # (B, S, d)
             x_flat    = x_multi.reshape(-1, d)                           # (B*S, d)
-            ref_flat  = x_clean.repeat(self.n_sw2_samples, 1)            # (B*S, d)
+            ref_flat  = x_clean.flatten(1).repeat(self.n_sw2_samples, 1)  # (B*S, d)
             transport = sliced_wasserstein_distance(
                 x_flat, ref_flat, num_projections=self.sw2_projections
             )
@@ -175,11 +189,11 @@ class HybridLoss(nn.Module):
         if lam_cal > 0:
             x_multi_cal = (
                 x_multi if lam_trans > 0
-                else flow.sample(h, num_samples=self.n_sw2_samples)
+                else flow.sample(y_degraded, num_samples=self.n_sw2_samples)[0]
             )                                                              # (B, S, d)
             cal_terms = []
             for i in range(B):
-                es = energy_score(x_multi_cal[i], x_clean[i])            # scalar
+                es = energy_score(x_multi_cal[i], x_clean.flatten(1)[i])  # scalar
                 cal_terms.append(es)
             calibration = torch.stack(cal_terms).mean()
 

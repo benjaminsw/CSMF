@@ -1,15 +1,9 @@
 """
 Conditional Affine Coupling Layers for CSMF
 
-Version: WP0.2-Coupling-v1.8.0
-Last Modified: 2026-03-08
+Version: WP0.2-Coupling-v1.7.0
+Last Modified: 2026-03-05
 Changelog:
-  v1.8.0 (2026-03-08): [A] Added ActNorm class — per-element affine transform with data-driven
-                        initialization; loc/log_scale initialized from first batch mean/std;
-                        forward: y=(x+loc)*exp(log_scale), inverse: x=y*exp(-log_scale)-loc;
-                        log_det tracked and returned; used by ScaleBlock intra-block (Pattern A)
-                        for training stability between coupling layers. NaN/Inf guards on init
-                        and forward/inverse pass.
   v1.7.0 (2026-03-05): [F] Added softclamp on shift t (t_max=5.0) — unconstrained t was exploding
                         exponentially through 9 coupling layers (|ΔB| reached 121,678 at scale3_coup3),
                         overwhelming later scales and preventing s from learning. Same softclamp
@@ -308,9 +302,6 @@ class ConditionalAffineCoupling(nn.Module):
         # Pool h if spatial (4D tensor: [B, h_dim, H', W'])
         if h.dim() == 4:
             h = torch.mean(h, dim=[2, 3])  # Global average pooling -> [B, h_dim]
-        
-        # DIAG-Z: h norm check
-        logger.warning(f"[DIAG] h.norm mean={h.norm(dim=-1).mean():.2f}, max={h.norm(dim=-1).max():.2f}")
             
         if self.debug:
             logger.debug(f"  Conditioning h: shape={h.shape}, norm={h.norm().item():.6f}")
@@ -361,8 +352,6 @@ class ConditionalAffineCoupling(nn.Module):
         # Same formula as scale: bounded range [-t_max, t_max], gradient never fully vanishes.
         t = self.t_max * t / torch.sqrt(1.0 + t ** 2)
         
-        # DIAG-Z: s/t range check post-clamp
-        logger.warning(f"[DIAG] s range=[{s.min():.4f},{s.max():.4f}], t range=[{t.min():.4f},{t.max():.4f}]")
 
                 
         # [v1.3 DEBUG] Log scale/shift output
@@ -379,12 +368,14 @@ class ConditionalAffineCoupling(nn.Module):
         
         # Check for NaN/Inf
         if torch.isnan(s).any() or torch.isinf(s).any():
-            logger.error("NaN/Inf in scale parameters — clamping to zero")
-            s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-
+            error_msg = "NaN or Inf detected in scale parameters"
+            logger.error(error_msg)
+            raise RuntimeWarning(error_msg)
+        
         if torch.isnan(t).any() or torch.isinf(t).any():
-            logger.error("NaN/Inf in shift parameters — clamping to zero")
-            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            error_msg = "NaN or Inf detected in shift parameters"
+            logger.error(error_msg)
+            raise RuntimeWarning(error_msg)
         
         # ========== DEBUG 4: TRANSFORMATION APPLICATION ==========
         if self.debug:
@@ -418,9 +409,6 @@ class ConditionalAffineCoupling(nn.Module):
                 x_B_out = (x_B - t) * torch.exp(-s)
                 x_out = torch.cat([x_A, x_B_out], dim=1)
                 log_det = log_det - s.sum(dim=1)
-                
-        # DIAG-Z: x_out explosion check
-        logger.warning(f"[DIAG] x_out mean={x_out.mean():.4e}, std={x_out.std():.4e}, max_abs={x_out.abs().max():.4e}")
 
 
         
@@ -599,99 +587,3 @@ def channel_mask(channels, split='half'):
         raise ValueError(f"Unknown split type: {split}")
     
     return mask
-
-class ActNorm(nn.Module):
-    """
-    Activation Normalization for normalizing flows.
-
-    Version: WP0.2-Coupling-v1.8.0
-    Performs per-element affine transform: y = (x + loc) * exp(log_scale)
-    Initialized from first batch so output ≈ N(0,1) at start of training.
-    After initialization, loc and log_scale are free learned parameters.
-
-    Note: ActNorm does NOT permanently enforce N(0,1) — it only stabilizes
-    signal scale during training so each subsequent coupling layer receives
-    a better-conditioned input. The NLL loss drives z → N(0,1) at the output.
-    """
-
-    def __init__(self, dim: int):
-        """
-        Args:
-            dim: Flattened input dimension.
-        """
-        super().__init__()
-        if dim <= 0:
-            raise ValueError(f"ActNorm: dim must be positive, got {dim}")
-        self.dim = dim
-        self.loc = nn.Parameter(torch.zeros(dim))
-        self.log_scale = nn.Parameter(torch.zeros(dim))
-        self.register_buffer('initialized', torch.tensor(False))
-
-    @torch.no_grad()
-    def initialize(self, x: torch.Tensor) -> None:
-        """Data-driven init from first batch: sets output mean≈0, std≈1."""
-        if x.shape[1] != self.dim:
-            logger.error(
-                f"ActNorm.initialize: input dim {x.shape[1]} != expected {self.dim}"
-            )
-            raise ValueError(f"ActNorm dim mismatch: {x.shape[1]} vs {self.dim}")
-
-        mean = x.mean(dim=0)   # [dim]
-        std  = x.std(dim=0).clamp(min=1e-6)   # [dim]
-
-        if torch.isnan(mean).any() or torch.isnan(std).any():
-            logger.error("ActNorm.initialize: NaN in first-batch mean/std — skipping init")
-            return
-
-        self.loc.data.copy_(-mean)
-        self.log_scale.data.copy_(-torch.log(std))
-        self.initialized.fill_(True)
-        logger.debug(
-            f"ActNorm initialized: loc norm={self.loc.norm().item():.4f}, "
-            f"log_scale norm={self.log_scale.norm().item():.4f}"
-        )
-
-    def forward(self, x: torch.Tensor, reverse: bool = False) -> tuple:
-        """
-        Args:
-            x:       [B, dim]
-            reverse: If True, apply inverse transform.
-        Returns:
-            (y, log_det): transformed tensor and log-determinant [B].
-        """
-        if x.shape[1] != self.dim:
-            logger.error(
-                f"ActNorm.forward: input dim {x.shape[1]} != expected {self.dim}"
-            )
-            raise ValueError(f"ActNorm dim mismatch: {x.shape[1]} vs {self.dim}")
-
-        # Lazy data-driven initialization on first forward pass
-        if not self.initialized:
-            self.initialize(x)
-
-        if torch.isnan(self.log_scale).any() or torch.isinf(self.log_scale).any():
-            logger.error("ActNorm: NaN/Inf in log_scale — resetting to zeros")
-            self.log_scale.data.zero_()
-
-        B = x.shape[0]
-        # log_det per sample: sum of log_scale (same for all samples)
-        log_det_per_dim = self.log_scale.sum()   # scalar
-
-        if not reverse:
-            y = (x + self.loc) * torch.exp(self.log_scale)
-            log_det = log_det_per_dim.expand(B)
-        else:
-            y = x * torch.exp(-self.log_scale) - self.loc
-            log_det = (-log_det_per_dim).expand(B)
-
-        if torch.isnan(y).any() or torch.isinf(y).any():
-            n_bad = (torch.isnan(y) | torch.isinf(y)).sum().item()
-            logger.error(
-                f"ActNorm: NaN/Inf in output ({n_bad} values, reverse={reverse}). "
-                f"loc norm={self.loc.norm().item():.4f}, "
-                f"log_scale range=[{self.log_scale.min().item():.4f}, "
-                f"{self.log_scale.max().item():.4f}]"
-            )
-            y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return y, log_det

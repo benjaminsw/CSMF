@@ -1,15 +1,22 @@
 """
 MNIST Configuration for WP0-WP3
 
-Version: WP0.1-Config-v1.2
-Last Modified: 2026-02-22
+Version: WP0.1-Config-v1.3
+Last Modified: 2026-02-25
 Changelog:
+  v1.3 (2026-02-25): Added PREPROCESSED_DIR for precomputed dataset path
+                     Added BLUR_SIGMA constant — single source of truth for preprocess_mnist.py
+                     Added config_hash() utility — MD5 of key params for cross-stage drift detection
+                     Added EXPERT_LR dict for per-expert learning rates in Stage A
   v1.2 (2026-02-22): Added flat constants required by train_csmf.py and
                      experiment scripts; nested MNIST_CONFIG preserved for
                      backward compatibility
   v1.1 (2025-12-09): Fixed version format, added optimizer field
   v1.0 (2025-12-01): Initial configuration
 """
+
+import logging
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Nested config (preserved for backward compatibility)
@@ -74,9 +81,10 @@ MNIST_CONFIG = {
 # =============================================================================
 
 # Paths
-DATA_ROOT   = MNIST_CONFIG['dataset']['root']       # './data/mnist'
-CKPT_DIR    = './checkpoints'
-RESULTS_DIR = './results'
+DATA_ROOT        = MNIST_CONFIG['dataset']['root']          # './data/mnist'
+PREPROCESSED_DIR = './data/preprocessed'                    # v1.3: precomputed .pt files
+CKPT_DIR         = './checkpoints'
+RESULTS_DIR      = './results'
 
 # Training
 BATCH_SIZE  = MNIST_CONFIG['training']['batch_size']        # 128
@@ -92,19 +100,49 @@ LATENT_DIM  = 784   # 28×28 flattened MNIST
 # Forward model / degradation
 DOWNSAMPLE_FACTOR = MNIST_CONFIG['forward_model']['downsample_factor']   # 2
 BLUR_KERNEL       = MNIST_CONFIG['forward_model']['blur_kernel_size']    # 5
+BLUR_SIGMA        = MNIST_CONFIG['forward_model']['blur_sigma']          # 1.0 — v1.3
 NOISE_SIGMA       = MNIST_CONFIG['forward_model']['noise_std']           # 0.1
 
 # Hybrid loss weights
-LAMBDA_CONS  = 0.1
-LAMBDA_TRANS = 0.01
+LAMBDA_CONS  = 0.0 #0.1
+LAMBDA_TRANS = 0.0 #0.01
 LAMBDA_CAL   = 0.0
 
 # Active experts for CSMF (subset of registry keys)
 ACTIVE_EXPERTS = ['realnvp', 'maf', 'nsf']
 
 # Training protocol
-VAL_SPLIT         = 0.1    # fraction of train set used for validation
-PATIENCE          = 5      # early stopping patience (epochs)
-BLOCKS_TO_UNFREEZE = 1     # Stage C: last N blocks unfrozen per expert
-TAU_START         = 1.1    # Stage C gate temperature start
-TAU_END           = 1.0    # Stage C gate temperature end
+VAL_SPLIT          = 0.1    # fraction of train set used for validation
+PATIENCE           = 5      # early stopping patience (epochs)
+BLOCKS_TO_UNFREEZE = 1      # Stage C: last N blocks unfrozen per expert
+TAU_START          = 1.1    # Stage C gate temperature start
+TAU_END            = 1.0    # Stage C gate temperature end
+
+# v1.3: Per-expert learning rates for Stage A (defaults to LR if key missing)
+EXPERT_LR = {
+    'realnvp': LR,   # 1e-3
+    'maf':     LR,   # 1e-3
+    'nsf':     LR,   # 1e-3
+}
+
+# =============================================================================
+# v1.3: config_hash() — MD5 of key training params
+# Used by save_checkpoint() and load_stage_checkpoint() to detect config drift
+# =============================================================================
+def config_hash() -> str:
+    import hashlib
+    import json
+    cfg = {
+        'DOWNSAMPLE_FACTOR': DOWNSAMPLE_FACTOR,
+        'BLUR_KERNEL':       BLUR_KERNEL,
+        'BLUR_SIGMA':        BLUR_SIGMA,
+        'NOISE_SIGMA':       NOISE_SIGMA,
+        'HIDDEN_DIM':        HIDDEN_DIM,
+        'LATENT_DIM':        LATENT_DIM,
+        'ACTIVE_EXPERTS':    sorted(ACTIVE_EXPERTS),
+    }
+    try:
+        return hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+    except Exception as e:
+        logger.error(f"MNIST-CFG | config_hash() failed: {e}")
+        raise

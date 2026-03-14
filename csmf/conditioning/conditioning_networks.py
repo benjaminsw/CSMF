@@ -2,18 +2,31 @@
 Conditioning Networks
 Extract features h = c_η(y) from degraded images
 
-Version: WP0.1-CondNet-v1.1
-Last Modified: 2025-12-09
+Version: WP0.1-CondNet-v1.3
+Last Modified: 2026-02-24
 Changelog:
-  v1.0 (2025-12-01): Initial implementation with stride-2 convs
+  v1.3 (2026-02-24): [P1] Added use_compile flag — applies torch.compile() to encoder (perf path)
+                     or spec_encoder Sequential (spec path) for op-fusion speedup; ~20-40% faster
+                     after one-time warmup (~30-60s first forward call); logged via _compiled flag;
+                     requires torch>=2.0; compile errors caught and logged as warnings with fallback
+                     to eager mode.
+  v1.2.1 (2026-02-22): [F1] Fixed false-positive A2 error — h.norm() replaced with h.norm(dim=1).mean()
+                       for per-sample threshold check; batch norm [B,h_dim]~85 != per-sample norm ~8.
+  v1.2 (2026-02-22): [C1] Added LayerNorm(h_dim) on both paths — fixes h norm ~5400 explosion;
+                     [A1] Xavier uniform (gain=0.1) + zero bias on fc layers to prevent early-training spike;
+                     [A2] h.norm() monitoring for first 50 forward calls via _fwd_log_count;
+                     perf path now global-avg-pools spatial output to flat [B,h_dim] before LayerNorm.
   v1.1 (2025-12-09): Added spec_compliant flag for validation (pooling+flatten)
+  v1.0 (2025-12-01): Initial implementation with stride-2 convs
 Dependencies: torch>=2.0
 """
 
-from venv import logger
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 class MNISTConditioner(nn.Module):
@@ -27,9 +40,12 @@ class MNISTConditioner(nn.Module):
         config: Configuration dictionary (from CONDITIONING_NET_CONFIG)
         spec_compliant: If True, use explicit pooling + flatten (matches WP0 spec)
                        If False, use stride-2 convs (better performance, default)
+        use_compile: If True, apply torch.compile() to encoder for op-fusion speedup.
+                    ~20-40% faster after ~30-60s one-time warmup on first forward call.
+                    Requires torch>=2.0. Falls back to eager on compile error.
     """
     
-    def __init__(self, in_channels=1, h_dim=64, config=None, spec_compliant=False, debug=False):
+    def __init__(self, in_channels=1, h_dim=64, config=None, spec_compliant=False, debug=False, use_compile=False):
         super().__init__()
         self.debug = debug
         
@@ -61,6 +77,31 @@ class MNISTConditioner(nn.Module):
             
             # After 2x pooling: 28→14→7, so flattened size is 64*7*7
             self.fc = nn.Linear(64 * 7 * 7, h_dim)
+            
+            # [C1] Output normalization — prevents h norm explosion (~5400 → ~sqrt(h_dim))
+            self.output_norm = nn.LayerNorm(h_dim)
+            
+            # [A1] Xavier init with small gain — prevents norm spike from epoch 1
+            nn.init.xavier_uniform_(self.fc.weight, gain=0.1)
+            nn.init.zeros_(self.fc.bias)
+
+            # [P1] torch.compile — wrap spec conv layers into Sequential for compilation
+            self.spec_encoder = nn.Sequential(
+                self.conv1, self.bn1, nn.ReLU(),
+                nn.MaxPool2d(2),
+                self.conv2, self.bn2, nn.ReLU(),
+                nn.MaxPool2d(2),
+            )
+            if use_compile:
+                try:
+                    self.spec_encoder = torch.compile(self.spec_encoder)
+                    self._compiled = True
+                    logger.info("[P1] MNISTConditioner spec_encoder compiled with torch.compile()")
+                except Exception as e:
+                    logger.warning(f"[P1] torch.compile failed — falling back to eager mode: {e}")
+                    self._compiled = False
+            else:
+                self._compiled = False
             
         else:
             # Performance-optimized: stride-2 convs (no explicit pooling)
@@ -101,6 +142,31 @@ class MNISTConditioner(nn.Module):
             layers.append(nn.ReLU())
             
             self.encoder = nn.Sequential(*layers)
+            
+            # [C1] Global avg pool + FC to produce flat [B, h_dim] + LayerNorm
+            # Fixes shape inconsistency (spatial [B,h_dim,H',W'] → flat [B,h_dim])
+            # and prevents h norm explosion
+            self.final_fc = nn.Linear(h_dim, h_dim)
+            self.output_norm = nn.LayerNorm(h_dim)
+            
+            # [A1] Xavier init with small gain on final_fc
+            nn.init.xavier_uniform_(self.final_fc.weight, gain=0.1)
+            nn.init.zeros_(self.final_fc.bias)
+
+            # [P1] torch.compile — compile encoder for op-fusion speedup
+            if use_compile:
+                try:
+                    self.encoder = torch.compile(self.encoder)
+                    self._compiled = True
+                    logger.info("[P1] MNISTConditioner encoder compiled with torch.compile()")
+                except Exception as e:
+                    logger.warning(f"[P1] torch.compile failed — falling back to eager mode: {e}")
+                    self._compiled = False
+            else:
+                self._compiled = False
+        
+        # [A2] Counter for h.norm() monitoring — first 50 forward calls
+        self._fwd_log_count = 0
     
     def forward(self, y):
         """
@@ -120,12 +186,30 @@ class MNISTConditioner(nn.Module):
 
         if self.spec_compliant:
             # WP0 spec path: explicit pooling + flatten
-            h = F.relu(self.bn1(self.conv1(y)))
-            h = F.max_pool2d(h, 2)  # 28→14
-            h = F.relu(self.bn2(self.conv2(h)))
-            h = F.max_pool2d(h, 2)  # 14→7
-            h = h.flatten(1)  # [B, 64*7*7]
-            h = self.fc(h)  # [B, h_dim]
+            # [P1] Uses spec_encoder (compiled or eager)
+            h = self.spec_encoder(y)           # [B, 64, 7, 7]
+            h = h.flatten(1)                   # [B, 64*7*7]
+            h = self.fc(h)                     # [B, h_dim]
+            h = self.output_norm(h)            # [C1] LayerNorm — normalise output scale
+
+            # [P1] Log one-time warmup notice on first compiled call
+            if self._compiled and self._fwd_log_count == 0:
+                logger.info("[P1] First forward call — torch.compile warmup in progress (~30-60s)")
+            
+            # [A2] Monitor h stats for first 50 calls
+            if self._fwd_log_count < 50:
+                per_sample_norm = h.norm(dim=1).mean().item()  # [F1] per-sample, not batch norm
+                logger.info(
+                    f"[A2] MNISTConditioner forward spec (call {self._fwd_log_count + 1}/50): "
+                    f"per_sample_norm={per_sample_norm:.4f}, std={h.std().item():.4f}, "
+                    f"max_abs={h.abs().max().item():.4f}"
+                )
+                if per_sample_norm > 50.0:
+                    logger.error(
+                        f"[A2] per-sample h norm={per_sample_norm:.4f} still elevated post-LayerNorm. "
+                        f"Check Xavier init was applied to self.fc."
+                    )
+                self._fwd_log_count += 1
             
             # ADD HERE - Before return (spec path)
             if self.debug:
@@ -133,8 +217,29 @@ class MNISTConditioner(nn.Module):
             
             return h
         else:
-            # Performance path: stride-2 convs (spatial output)
+            # Performance path: stride-2 convs → global avg pool → flat [B, h_dim]
+            # [P1] Uses encoder (compiled or eager)
+            if self._compiled and self._fwd_log_count == 0:
+                logger.info("[P1] First forward call — torch.compile warmup in progress (~30-60s)")
             h = self.encoder(y)
+            h = h.mean(dim=[2, 3])      # Global avg pool: [B, h_dim, H', W'] → [B, h_dim]
+            h = self.final_fc(h)         # [B, h_dim]
+            h = self.output_norm(h)      # [C1] LayerNorm — normalise output scale
+            
+            # [A2] Monitor h stats for first 50 calls
+            if self._fwd_log_count < 50:
+                per_sample_norm = h.norm(dim=1).mean().item()  # [F1] per-sample, not batch norm
+                logger.info(
+                    f"[A2] MNISTConditioner forward perf (call {self._fwd_log_count + 1}/50): "
+                    f"per_sample_norm={per_sample_norm:.4f}, std={h.std().item():.4f}, "
+                    f"max_abs={h.abs().max().item():.4f}"
+                )
+                if per_sample_norm > 50.0:
+                    logger.error(
+                        f"[A2] per-sample h norm={per_sample_norm:.4f} still elevated post-LayerNorm. "
+                        f"Check Xavier init was applied to self.final_fc."
+                    )
+                self._fwd_log_count += 1
             
             # ADD HERE - Before return (performance path)
             if self.debug:

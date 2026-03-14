@@ -1,11 +1,24 @@
-# Version: WP0.3-CondNSF-v1.0
+# Version: WP0.3-CondNSF-v1.2
 # Abbr: COND-NSF
-# Dependencies: ConditionalAffineCoupling (Level 2)
+# Last Modified: 2026-02-28
+# Changelog:
+#   v1.2 (2026-02-28): [BN] Removed BatchNorm1d between coupling layers — same batch/running
+#                      stat mismatch as NICE would cause inv_err explosion; RQ-spline outputs
+#                      bounded to [-B,B] so no scale explosion risk without BN; FiLM inside
+#                      coupling layers provides sufficient stabilisation; deleted _bn_inverse();
+#                      forward/inverse loops simplified to coupling layers only
+#   v1.1 (2026-02-24): [F1] Added FiLM modulation to ConditionalRQSplineCoupling
+#   v1.0 (original):   Initial RQ-spline coupling + BatchNorm stack
+# Dependencies: torch>=2.0, film.py WP0.1-FiLM-v1.0+
 # Reference: Durkan et al. (2019) - Neural Spline Flows
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from csmf.conditioning.film import FiLM  # [F1] v1.1 — shared FiLM module
+
+logger = logging.getLogger(__name__)
 
 class RationalQuadraticSpline:
     """
@@ -146,27 +159,52 @@ class RationalQuadraticSpline:
 class ConditionalRQSplineCoupling(nn.Module):
     """
     Coupling layer with rational-quadratic spline transforms.
-    
+
     x_B' = RQSpline(x_B; θ(x_A, h))
     where θ = {widths, heights, derivatives}
+
+    [F1] v1.1: param_net replaced with explicit fc1/fc2/fc3 + FiLM after each hidden ReLU.
+    h is still concatenated at input AND guides hidden layers via FiLM.
     """
     def __init__(self, dim, cond_dim, hidden=128, K=8, B=3.0):
         super().__init__()
         self.K = K
         self.B = B
-        
-        # Network outputs spline parameters
-        self.param_net = nn.Sequential(
-            nn.Linear(dim//2 + cond_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, (dim//2) * (3*K - 1))  # widths + heights + derivatives
-        )
-    
+        self.cond_dim = cond_dim
+        out_dim = (dim // 2) * (3 * K - 1)   # widths + heights + derivatives
+
+        # [F1] v1.1 — Explicit layers (replacing nn.Sequential) to allow FiLM insertion
+        self.fc1   = nn.Linear(dim // 2 + cond_dim, hidden)  # input: [xA | h]
+        self.fc2   = nn.Linear(hidden, hidden)
+        self.fc3   = nn.Linear(hidden, out_dim)               # output: spline params (no FiLM)
+        self.act   = nn.ReLU()
+        self.film1 = FiLM(f_dim=hidden, h_dim=cond_dim)      # [F1] after hidden layer 1
+        self.film2 = FiLM(f_dim=hidden, h_dim=cond_dim)      # [F1] after hidden layer 2
+
+        logger.info(f"ConditionalRQSplineCoupling v1.1 initialized: dim={dim}, cond_dim={cond_dim}, hidden={hidden}, K={K}, B={B}, FiLM=True")
+
+    def _compute_params(self, xA, h):
+        """
+        Compute raw spline params with FiLM modulation at each hidden layer.
+        Shared by forward() and inverse() to avoid code duplication.
+        """
+        inp = torch.cat([xA, h], dim=1)          # [xA | h] — h at input (kept from v1.0)
+        out = self.act(self.fc1(inp))
+        out = self.film1(out, h)                  # [F1] FiLM after hidden layer 1
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            logger.error("[COND-NSF] NaN/Inf after film1 in _compute_params")
+            raise RuntimeError("NaN/Inf after film1 in _compute_params")
+        out = self.act(self.fc2(out))
+        out = self.film2(out, h)                  # [F1] FiLM after hidden layer 2
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            logger.error("[COND-NSF] NaN/Inf after film2 in _compute_params")
+            raise RuntimeError("NaN/Inf after film2 in _compute_params")
+        return self.fc3(out)                      # raw spline params — no FiLM (would corrupt outputs)
+
     def forward(self, x, h):
         # Accept either full (B, dim) or half (B, dim//2)
-        if x.shape[1] == self.param_net[0].in_features - h.shape[1]:  # dim//2
+        # [F1] v1.1: half_only check updated from param_net[0].in_features → fc1.in_features
+        if x.shape[1] == self.fc1.in_features - h.shape[1]:  # dim//2
             xA = torch.zeros(x.shape[0], x.shape[1], device=x.device, dtype=x.dtype)
             xB = x
             half_only = True
@@ -174,8 +212,7 @@ class ConditionalRQSplineCoupling(nn.Module):
             xA, xB = x.chunk(2, dim=1)
             half_only = False
 
-        inp = torch.cat([xA, h], dim=1)
-        params = self.param_net(inp)
+        params = self._compute_params(xA, h)      # [F1] FiLM-conditioned spline params
 
         params = params.reshape(x.shape[0], -1, 3*self.K - 1)
         widths_raw = params[..., :self.K]
@@ -195,9 +232,9 @@ class ConditionalRQSplineCoupling(nn.Module):
             return xB_new, log_det
         return torch.cat([xA, xB_new], dim=1), log_det
 
-    
     def inverse(self, z, h):
-        if z.shape[1] == (self.param_net[0].in_features - h.shape[1]):  # dim//2
+        # [F1] v1.1: half_only check updated from param_net[0].in_features → fc1.in_features
+        if z.shape[1] == (self.fc1.in_features - h.shape[1]):  # dim//2
             zA = torch.zeros(z.shape[0], z.shape[1], device=z.device, dtype=z.dtype)
             zB = z
             half_only = True
@@ -205,8 +242,7 @@ class ConditionalRQSplineCoupling(nn.Module):
             zA, zB = z.chunk(2, dim=1)
             half_only = False
 
-        inp = torch.cat([zA, h], dim=1)
-        params = self.param_net(inp)
+        params = self._compute_params(zA, h)      # [F1] same _compute_params — no duplication
 
         params = params.reshape(z.shape[0], -1, 3*self.K - 1)
         widths_raw = params[..., :self.K]
@@ -224,88 +260,47 @@ class ConditionalRQSplineCoupling(nn.Module):
         if half_only:
             return xB
         return torch.cat([zA, xB], dim=1)
-
-
-
 class ConditionalNSF(nn.Module):
     """
     Conditional Neural Spline Flow (coupling variant).
-    
-    Stacks RQ-spline coupling layers with batch norm.
+
+    Stacks RQ-spline coupling layers (no BatchNorm).
+    BatchNorm removed in v1.2 — batch/running stat mismatch breaks exact invertibility.
+    RQ-spline outputs bounded to [-B,B]; FiLM provides stabilisation.
     """
     def __init__(self, dim, cond_dim, num_layers=4, hidden=128, K=8, B=3.0):
         super().__init__()
         self.dim = dim
-        
+
+        # [BN] v1.2: BatchNorm1d removed — coupling layers only
         layers = []
         for i in range(num_layers):
-            # RQ-spline coupling
             layers.append(ConditionalRQSplineCoupling(dim, cond_dim, hidden, K, B))
-            
-            # Batch norm for stability
-            layers.append(nn.BatchNorm1d(dim))
-        
+
         self.layers = nn.ModuleList(layers)
     
     def forward(self, x, h):
         """
         Forward: x → z
-        
+
         Returns:
             z: (B, d) latent
             log_det: (B,) total log-Jacobian
         """
         log_det = torch.zeros(x.shape[0], device=x.device)
-        
+
         z = x
         for layer in self.layers:
-            if isinstance(layer, ConditionalRQSplineCoupling):
-                z, ld = layer(z, h)
-                log_det += ld
-            else:  # BatchNorm
-                z = layer(z)
-        
+            # [BN] v1.2: all layers are ConditionalRQSplineCoupling — no BN branch needed
+            z, ld = layer(z, h)
+            log_det += ld
+
         return z, log_det
     
     
-    def _bn_inverse(self, bn: nn.BatchNorm1d, y: torch.Tensor) -> torch.Tensor:
-        # In eval mode BN is affine using running stats
-        mean = bn.running_mean
-        var = bn.running_var
-        eps = bn.eps
-
-        if bn.affine:
-            w = bn.weight
-            b = bn.bias
-            w = torch.where(w == 0, torch.ones_like(w), w)  # safety
-            x = (y - b) / w
-        else:
-            x = y
-
-        x = x * torch.sqrt(var + eps) + mean
-        return x
-
-        
     def inverse(self, z, h):
+        # [BN] v1.2: all layers are ConditionalRQSplineCoupling — no BN to invert
         x = z
         for layer in reversed(self.layers):
-            if isinstance(layer, ConditionalRQSplineCoupling):
-                x = layer.inverse(x, h)
-            elif isinstance(layer, nn.BatchNorm1d):
-                x = self._bn_inverse(layer, x)
+            x = layer.inverse(x, h)
         return x
-
-    
-    
-    
-    #def inverse(self, z, h):
-        """
-        Inverse: z → x (for sampling)
-        """
-    #    x = z
-    #    for layer in reversed(self.layers):
-    #        if isinstance(layer, ConditionalRQSplineCoupling):
-    #            x = layer.inverse(x, h)
-            # Skip BatchNorm in inverse
-        
-    #    return x

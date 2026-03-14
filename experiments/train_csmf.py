@@ -1,12 +1,36 @@
 # =============================================================================
-# Version: WP3.2-TrainMain-v1.1 | Abbr: TRAIN-MAIN
+# Version: WP3.2-TrainMain-v1.6 | Abbr: TRAIN-MAIN
 # Description: Main CSMF training script — 3-stage protocol with expert registry
 # Changelog:
+#   v1.6 (2026-03-01): Added --skip-sanity CLI flag; after Stage A calls
+#                      run_expert_sanity() from EXP-SANITY for diagnostic checks
+#                      and plots (Core 1-3 + A/D/F); epoch_logs captured from
+#                      train_stage_A() return value (v1.3.7); output to
+#                      results/expert_sanity/
+#   v1.5 (2026-02-28): BUG FIX — SR forward model kernel was on CPU while x_hat was
+#                      on CUDA; added hybrid_loss.A.to(device) after build_loss();
+#                      also moves hybrid_loss to device if it is nn.Module
+#   v1.4 (2026-02-28): GPU support — auto-detect cuda/cpu device after fix_seed();
+#                      model.to(device) after build_model(); eval_final() moves
+#                      x_clean/y_deg to device in dataloader loop; device logged
+#                      at INFO level; no API changes to stage methods
+#   v1.3 (2026-02-25): Replaced build_dataloaders() + MNISTInverseDataset with
+#                      create_precomputed_dataloaders() from PREP-MNIST
+#                      Stage A optimizer changed from shared optimizer_A to optimizer_fn
+#                      callable for per-expert LR support
+#                      load_stage_checkpoint() extended with config_hash verification —
+#                      raises ValueError on drift
+#                      Added --preprocessed-dir and --expert-lr CLI args; config_params
+#                      dict built from mnist_config and passed for metadata validation
+#   v1.2 (2025-02-23): Separate-stage training: auto-load prior-stage checkpoint
+#                      when a stage is skipped; added --ckpt-A/B/C CLI overrides
+#                      for per-stage checkpoint paths; added metadata validation
+#                      to verify expert config matches before loading
 #   v1.1 (2025-02-21): Added NICE/NSF to expert registry, ACTIVE_EXPERTS config
 #                      toggle, per-expert NLL breakdown in final eval, gate usage
 #                      stats, argparse CLI overrides, seed fixing, JSON eval save
 #   v1.0 (2025-02-21): Initial 3-stage training script
-# Dependencies: CSMF-MAIN, HYBRID, MNIST-INV, MNIST-CFG
+# Dependencies: CSMF-MAIN, HYBRID, PREP-MNIST, MNIST-CFG
 # =============================================================================
 
 import os
@@ -19,22 +43,23 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
 from configs.mnist_config import (
-    DATA_ROOT, CKPT_DIR, RESULTS_DIR,
+    DATA_ROOT, PREPROCESSED_DIR, CKPT_DIR, RESULTS_DIR,
     BATCH_SIZE, EPOCHS, LR, SEED,
     HIDDEN_DIM, NUM_LAYERS, LATENT_DIM,
-    DOWNSAMPLE_FACTOR, BLUR_KERNEL, NOISE_SIGMA,
+    DOWNSAMPLE_FACTOR, BLUR_KERNEL, BLUR_SIGMA, NOISE_SIGMA,
     LAMBDA_CONS, LAMBDA_TRANS, LAMBDA_CAL,
     ACTIVE_EXPERTS,
     VAL_SPLIT, PATIENCE,
     BLOCKS_TO_UNFREEZE, TAU_START, TAU_END,
+    config_hash,
 )
-from data.mnist_inverse import MNISTInverseDataset
+from scripts.preprocess_mnist import create_precomputed_dataloaders
 from csmf.conditioning.conditioning_networks import MNISTConditioner
 from csmf.flows.conditional_realnvp import ConditionalRealNVP
 from csmf.flows.conditional_maf import ConditionalMAF
@@ -43,6 +68,7 @@ from csmf.flows.conditional_nsf import ConditionalNSF
 from csmf.models.csmf import CSMF
 from csmf.physics.forward_models import SRForwardModel
 from csmf.losses.hybrid_loss import HybridLoss
+from csmf.evaluation.expert_sanity import run_expert_sanity  # v1.6: EXP-SANITY
 
 # ---------------------------------------------------------------------------
 # Expert registry — add/remove entries to test combinations
@@ -122,60 +148,124 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results-dir", type=str, default=None,
                    help="Results directory (overrides config RESULTS_DIR)")
 
-    # Resume from checkpoint
+    # Resume from checkpoint (general)
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint to resume from")
+
+    # Per-stage checkpoint path overrides (for separate-stage training)
+    p.add_argument("--ckpt-A", type=str, default=None,
+                   help="Path to Stage A checkpoint to load when skipping Stage A "
+                        "(default: <ckpt-dir>/csmf_stage_A.pth)")
+    p.add_argument("--ckpt-B", type=str, default=None,
+                   help="Path to Stage B checkpoint to load when skipping Stage B "
+                        "(default: <ckpt-dir>/csmf_stage_B.pth)")
+    p.add_argument("--ckpt-C", type=str, default=None,
+                   help="Path to Stage C checkpoint to load when skipping Stage C "
+                        "(default: <ckpt-dir>/csmf_stage_C.pth)")
+
+    # v1.3: precomputed data path
+    p.add_argument("--preprocessed-dir", type=str, default=None,
+                   help="Path to precomputed .pt files (overrides config PREPROCESSED_DIR)")
+
+    # v1.3: per-expert learning rates e.g. --expert-lr realnvp=1e-3 maf=5e-4
+    p.add_argument("--expert-lr", nargs="+", default=None,
+                   metavar="NAME=LR",
+                   help="Per-expert LR as name=value pairs, e.g. realnvp=1e-3 maf=5e-4")
+
+    # v1.6: skip expert sanity checks after Stage A
+    p.add_argument("--skip-sanity", action="store_true", default=False,
+                   help="Skip EXP-SANITY diagnostic checks/plots after Stage A")
 
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Data
+# Checkpoint loader with metadata validation
 # ---------------------------------------------------------------------------
 
-def build_dataloaders(
-    data_root: str,
-    batch_size: int,
-    val_split: float,
-    blur_kernel_size: int,
-    downsample_factor: int,
-    noise_std: float,
+def load_stage_checkpoint(
+    model: "CSMF",
+    ckpt_path: str,
+    stage_label: str,
+    experts_cfg: list,
     logger: logging.Logger,
-) -> tuple:
+) -> None:
     """
-    Build train / val / test DataLoaders from MNISTInverseDataset.
+    Load a stage checkpoint into *model* with optional expert-config validation.
 
-    Returns:
-        train_loader, val_loader, test_loader
+    Validation logic:
+      - If checkpoint contains 'active_experts' metadata, verify it matches
+        the current experts_cfg.  Mismatch → ERROR + raise.
+      - If checkpoint has no metadata (older format), log a warning and
+        continue loading state_dict only.
+
+    Args:
+        model:        CSMF instance to load weights into.
+        ckpt_path:    Path to the .pth checkpoint file.
+        stage_label:  Human-readable stage name, e.g. "A".
+        experts_cfg:  Current active expert list (for validation).
+        logger:       Logger instance.
+
+    Raises:
+        FileNotFoundError: checkpoint file does not exist.
+        ValueError:         expert config mismatch detected.
+        RuntimeError:       state_dict load fails.
     """
-    train_full = MNISTInverseDataset(
-        root=data_root, train=True,
-        blur_kernel_size=blur_kernel_size, downsample_factor=downsample_factor, noise_std=noise_std,
-    )
-    test_ds = MNISTInverseDataset(
-        root=data_root, train=False,
-        blur_kernel_size=blur_kernel_size, downsample_factor=downsample_factor, noise_std=noise_std,
-    )
+    if not os.path.isfile(ckpt_path):
+        logger.error(
+            f"Stage {stage_label} checkpoint not found: {ckpt_path} | "
+            f"Run Stage {stage_label} first or provide --ckpt-{stage_label}."
+        )
+        raise FileNotFoundError(
+            f"Stage {stage_label} checkpoint not found: {ckpt_path}"
+        )
 
-    n_val   = int(len(train_full) * val_split)
-    n_train = len(train_full) - n_val
-    train_ds, val_ds = random_split(
-        train_full, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
+    try:
+        meta = model.load_checkpoint(ckpt_path)
+        logger.info(f"Loaded Stage {stage_label} checkpoint: {ckpt_path} | meta={meta}")
+    except Exception as e:
+        logger.error(f"Failed to load Stage {stage_label} checkpoint {ckpt_path}: {e}")
+        raise RuntimeError(
+            f"Stage {stage_label} checkpoint load failed: {e}"
+        ) from e
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=True)
+    # Metadata validation — expert config check
+    if meta and "active_experts" in meta:
+        saved_experts = meta["active_experts"]
+        if sorted(saved_experts) != sorted(experts_cfg):
+            logger.error(
+                f"Expert config mismatch for Stage {stage_label} checkpoint | "
+                f"checkpoint={saved_experts} | current={experts_cfg}"
+            )
+            raise ValueError(
+                f"Expert config mismatch: checkpoint has {saved_experts}, "
+                f"current run has {experts_cfg}. "
+                f"Use matching --experts or provide a compatible --ckpt-{stage_label}."
+            )
+        logger.info(
+            f"Stage {stage_label} metadata validated | active_experts={saved_experts}"
+        )
+    else:
+        logger.warning(
+            f"Stage {stage_label} checkpoint has no 'active_experts' metadata — "
+            f"skipping expert config validation. Ensure checkpoints match current run."
+        )
 
-    logger.info(
-        f"Data | train={n_train} | val={n_val} | test={len(test_ds)} | "
-        f"batch={batch_size} | blur_kernel_size={blur_kernel_size} | downsample_factor={downsample_factor} | noise_std={noise_std}"
-    )
-    return train_loader, val_loader, test_loader
+    # v1.3: config_hash drift check
+    if 'config_hash' in meta:
+        current_hash = config_hash()
+        if meta['config_hash'] != current_hash:
+            logger.error(
+                f"Config hash mismatch on Stage {stage_label} checkpoint | "
+                f"saved={meta['config_hash']} | current={current_hash} | "
+                f"Re-run from Stage A with current config."
+            )
+            raise ValueError(f"Config hash mismatch on Stage {stage_label} checkpoint")
+    else:
+        logger.warning(
+            f"Stage {stage_label} checkpoint has no config_hash — "
+            f"skipping config drift check (pre-v1.3 checkpoint)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +411,8 @@ def eval_final(
     n_batches      = 0
 
     for x_clean, y_deg in test_loader:
+        x_clean = x_clean.to(next(model.parameters()).device)
+        y_deg   = y_deg.to(next(model.parameters()).device)
         # Mixture NLL
         log_q, log_q_experts = model.forward(x_clean, y_deg)
         nll = -log_q.mean()
@@ -342,7 +434,9 @@ def eval_final(
         # Residual ||Ax - y||
         x_samples, _ = model.sample(y_deg, num_samples=1)
         x_hat         = x_samples[:, 0, :]             # (B, d)
-        Ax            = hybrid_loss.A.forward(x_hat)
+        x_hat_4d      = x_hat.view(x_hat.shape[0], 1, 28, 28) # reshape for SR model
+        #Ax            = hybrid_loss.A.forward(x_hat)
+        Ax            = hybrid_loss.A.forward(x_hat_4d) 
         residual      = torch.mean((Ax - y_deg) ** 2).item()
 
         total_nll      += nll.item()
@@ -414,12 +508,13 @@ def main() -> None:
     results_dir = args.results_dir or RESULTS_DIR
     experts_cfg = args.experts     or ACTIVE_EXPERTS
     stages      = args.stages
+    preprocessed_dir = args.preprocessed_dir or PREPROCESSED_DIR  # v1.3
 
     # --- Logging ---
     log_path = os.path.join(results_dir, "train_csmf.log")
     logger   = setup_logging(log_path)
     logger.info("=" * 60)
-    logger.info("CSMF Training | WP3.2-TrainMain-v1.1 | TRAIN-MAIN")
+    logger.info("CSMF Training | WP3.2-TrainMain-v1.3 | TRAIN-MAIN")
     logger.info("=" * 60)
 
     # --- Config summary ---
@@ -437,19 +532,39 @@ def main() -> None:
     fix_seed(seed)
     logger.info(f"Seed fixed: {seed}")
 
+    # --- Device ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}" + (
+        f" | {torch.cuda.get_device_name(0)}" if device.type == "cuda" else " (CPU — no GPU detected)"
+    ))
+
     # --- Dirs ---
     os.makedirs(ckpt_dir,    exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
+    # --- Resolve per-stage checkpoint paths ---
+    # CLI --ckpt-A/B/C override; otherwise fall back to default paths in ckpt_dir
+    ckpt_path_A = args.ckpt_A or os.path.join(ckpt_dir, "csmf_stage_A.pth")
+    ckpt_path_B = args.ckpt_B or os.path.join(ckpt_dir, "csmf_stage_B.pth")
+    ckpt_path_C = args.ckpt_C or os.path.join(ckpt_dir, "csmf_stage_C.pth")
+    logger.info(
+        f"Stage checkpoint paths | A={ckpt_path_A} | B={ckpt_path_B} | C={ckpt_path_C}"
+    )
+
     # --- Data ---
-    train_loader, val_loader, test_loader = build_dataloaders(
-        data_root        = DATA_ROOT,
+    config_params = {
+        'blur_kernel_size':  BLUR_KERNEL,
+        'blur_sigma':        BLUR_SIGMA,
+        'downsample_factor': DOWNSAMPLE_FACTOR,
+        'noise_std':         NOISE_SIGMA,
+        'normalize':         '[0,1]',
+        'val_split':         VAL_SPLIT,
+        'seed':              seed,
+    }
+    train_loader, val_loader, test_loader = create_precomputed_dataloaders(
+        preprocessed_dir = preprocessed_dir,
         batch_size       = batch_size,
-        val_split        = VAL_SPLIT,
-        blur_kernel_size = BLUR_KERNEL,
-        downsample_factor= DOWNSAMPLE_FACTOR,
-        noise_std        = NOISE_SIGMA,
-        logger           = logger,
+        config_params    = config_params,   # validates metadata.json on load
     )
 
     # --- Model ---
@@ -460,8 +575,10 @@ def main() -> None:
         latent_dim     = LATENT_DIM,
         logger         = logger,
     )
+    model = model.to(device)
+    logger.info(f"Model moved to {device}")
 
-    # --- Resume from checkpoint ---
+    # --- General resume (overrides all stages if provided) ---
     if args.resume:
         try:
             meta = model.load_checkpoint(args.resume)
@@ -478,6 +595,16 @@ def main() -> None:
         lambda_cal        = LAMBDA_CAL,
         logger            = logger,
     )
+    # Move forward model (SR kernel) to same device as model
+    try:
+        hybrid_loss.A = hybrid_loss.A.to(device)
+        logger.info(f"SRForwardModel moved to {device}")
+    except Exception as e:
+        logger.error(f"Failed to move hybrid_loss.A to {device}: {e}")
+        raise
+    if isinstance(hybrid_loss, nn.Module):
+        hybrid_loss = hybrid_loss.to(device)
+        logger.info(f"HybridLoss moved to {device}")
 
     epochs_per_stage = epochs // 3
 
@@ -489,33 +616,81 @@ def main() -> None:
         logger.info("Stage A: Expert Training")
         logger.info("=" * 40)
         try:
-            optimizer_A = torch.optim.Adam(
-                [p for expert in model.experts for p in expert.parameters()],
-                lr=lr,
-            )
-            model.train_stage_A(
+            # v1.3: per-expert optimizer_fn callable; supports --expert-lr per expert
+            if args.expert_lr:
+                expert_lr_map = dict(pair.split('=') for pair in args.expert_lr)
+                optimizer_fn = lambda expert: torch.optim.Adam(
+                    expert.parameters(),
+                    lr=float(expert_lr_map.get(
+                        type(expert).__name__.replace('Conditional', '').lower(), lr
+                    ))
+                )
+            else:
+                optimizer_fn = lambda expert: torch.optim.Adam(
+                    expert.parameters(), lr=lr
+                )
+            epoch_logs = model.train_stage_A(
                 dataloader   = train_loader,
-                optimizer    = optimizer_A,
+                optimizer_fn = optimizer_fn,
                 hybrid_loss  = hybrid_loss,
                 epochs       = epochs_per_stage,
                 lambda_cons  = LAMBDA_CONS,
                 val_loader   = val_loader,
                 patience     = PATIENCE,
-                ckpt_path    = os.path.join(ckpt_dir, "csmf_stage_A.pth"),
+                ckpt_dir     = ckpt_dir,
+                fwd_model    = hybrid_loss.A,
             )
             logger.info("Stage A complete.")
+
+            # v1.6: EXP-SANITY — diagnostic checks and plots after Stage A
+            if not args.skip_sanity and val_loader is not None:
+                try:
+                    sanity_dir = os.path.join(results_dir, "expert_sanity")
+                    sanity_summary = run_expert_sanity(
+                        csmf_model     = model,
+                        val_loader     = val_loader,
+                        fwd_model      = hybrid_loss.A,
+                        epoch_logs     = epoch_logs,
+                        output_dir     = sanity_dir,
+                        plots          = ["1", "2", "3", "A", "D", "F"],
+                    )
+                    logger.info(f"EXP-SANITY complete | summary: {sanity_summary}")
+                except ValueError as e:
+                    logger.error(f"EXP-SANITY fatal check failed — aborting: {e}")
+                    raise
+                except Exception as e:
+                    logger.warning(f"EXP-SANITY non-fatal error (continuing): {e}")
+            elif args.skip_sanity:
+                logger.info("EXP-SANITY skipped (--skip-sanity)")
+            else:
+                logger.info("EXP-SANITY skipped (no val_loader)")
+
         except Exception as e:
             logger.error(f"Stage A failed: {e}")
             raise
     else:
-        logger.info("Stage A skipped (not in --stages)")
-        # If skipping A, experts must already be frozen; warn if not
+        logger.info("Stage A skipped — loading checkpoint for downstream stages.")
+        # Auto-load Stage A checkpoint so experts are properly initialised
+        # before Stage B (gate training) can begin.
+        if not args.resume:
+            load_stage_checkpoint(
+                model       = model,
+                ckpt_path   = ckpt_path_A,
+                stage_label = "A",
+                experts_cfg = experts_cfg,
+                logger      = logger,
+            )
+        else:
+            logger.info(
+                "Stage A auto-load skipped — general --resume checkpoint already loaded."
+            )
+        # Warn if any expert still has trainable params (should be frozen in saved ckpt)
         for k, expert in enumerate(model.experts):
             n = sum(p.requires_grad for p in expert.parameters())
             if n > 0:
                 logger.warning(
-                    f"Skipping Stage A but expert {k} has {n} trainable params — "
-                    f"freeze manually before Stage B."
+                    f"After loading Stage A ckpt, expert {k} has {n} trainable params — "
+                    f"Stage A checkpoint may not have frozen experts correctly."
                 )
 
     # =========================================================================
@@ -537,14 +712,28 @@ def main() -> None:
                 epochs      = epochs_per_stage,
                 val_loader  = val_loader,
                 patience    = PATIENCE,
-                ckpt_path   = os.path.join(ckpt_dir, "csmf_stage_B.pth"),
+                ckpt_path   = ckpt_path_B,
             )
             logger.info("Stage B complete.")
         except Exception as e:
             logger.error(f"Stage B failed: {e}")
             raise
     else:
-        logger.info("Stage B skipped (not in --stages)")
+        logger.info("Stage B skipped — loading checkpoint for downstream stages.")
+        # Auto-load Stage B checkpoint so gate weights are properly initialised
+        # before Stage C (joint fine-tuning) can begin.
+        if not args.resume:
+            load_stage_checkpoint(
+                model       = model,
+                ckpt_path   = ckpt_path_B,
+                stage_label = "B",
+                experts_cfg = experts_cfg,
+                logger      = logger,
+            )
+        else:
+            logger.info(
+                "Stage B auto-load skipped — general --resume checkpoint already loaded."
+            )
 
     # =========================================================================
     # Stage C — Joint fine-tuning
@@ -568,7 +757,7 @@ def main() -> None:
                 tau_end            = TAU_END,
                 val_loader         = val_loader,
                 patience           = PATIENCE,
-                ckpt_path          = os.path.join(ckpt_dir, "csmf_stage_C.pth"),
+                ckpt_path          = ckpt_path_C,
             )
             logger.info("Stage C complete.")
         except Exception as e:

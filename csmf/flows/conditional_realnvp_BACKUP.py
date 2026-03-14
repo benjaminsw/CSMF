@@ -1,25 +1,10 @@
 """
 ConditionalRealNVP for MNIST Inverse Problems - Multi-Scale Architecture
 
-Version: WP0.3-CondRNVP-v2.3.2
+Version: WP0.3-CondRNVP-v2.2.0
 Abbr: COND-RNVP
-Last Modified: 2026-03-09
+Last Modified: 2026-03-08
 Changelog:
-  v2.3.2 (2026-03-09): [F1] Fixed inverse loop order in ScaleBlock — forward is perm →
-                        coupling → ActNorm, so inverse must be ActNorm(rev) → coupling(rev)
-                        → inv_perm; previous order (inv_perm first) caused inv_err=5.87
-                        crashing Stage A eval; [F2] Fixed debug per-layer invertibility
-                        check — z_flat is post-ActNorm so must invert ActNorm before
-                        coupling to get valid z_before comparison.
-  v2.3.1 (2026-03-09): [F] Widened range check threshold from -10/10 to -15/15 — logit
-                        with clamp(1e-6) on MNIST produces ~[-13.8,13.8] which is expected;
-                        updated comment to reflect actual range; no functional change.
-  v2.3.0 (2026-03-08): [A] ActNorm intra-block (Pattern A) — one ActNorm per coupling layer
-                        in each ScaleBlock; applied immediately after each coupling before
-                        permutation: coupling_i → ActNorm_i → perm_{i+1}; stabilizes signal
-                        scale during training so each subsequent coupling receives better-
-                        conditioned input; log_det from ActNorm tracked and added to total;
-                        inverse loop applies ActNorm in reverse after inv_perm.
   v2.2.0 (2026-03-08): [F1] Alternating split_dim in ScaleBlock — even layers use first-half
                         as conditioner, odd layers use second-half; every dimension is now
                         transformed at least once per block, fixing the NLL plateau (~-150)
@@ -59,7 +44,7 @@ import logging
 try:
     from configs.mnist_config import MNIST_CONFIG
     from csmf.conditioning.conditioning_networks import MNISTConditioner
-    from csmf.flows.coupling_layers import ConditionalAffineCoupling, ActNorm
+    from csmf.flows.coupling_layers import ConditionalAffineCoupling
 except ImportError as e:
     logging.error(f"Failed to import dependencies: {e}")
     raise
@@ -104,9 +89,7 @@ class ScaleBlock(nn.Module):
                 h_dim=h_dim,
                 hidden_dims=hidden_dims,
                 use_batch_norm=False,
-                #s_max=0.65,
-                s_max=0.5,
-                t_max=1.0,
+                s_max=0.65,
                 debug=self.debug
             )
             self.coupling_layers.append(layer)
@@ -122,9 +105,6 @@ class ScaleBlock(nn.Module):
 
             if self.debug:
                 logger.debug(f"ScaleBlock: layer {i+1}/{n_layers}, dim={dim}, split={split_dim}")
-
-        # [A] v2.3.0 — One ActNorm per coupling layer for intra-block signal stabilization
-        self.actnorms = nn.ModuleList([ActNorm(dim) for _ in range(n_layers)])
     
     def forward(
         self,
@@ -150,7 +130,7 @@ class ScaleBlock(nn.Module):
         z_flat = z.reshape(B, -1)
         
         if not reverse:
-            # ========== FORWARD: coupling → ActNorm → permutation ==========
+            # ========== FORWARD: coupling → squeeze ==========
             for i, coupling in enumerate(self.coupling_layers):
                 # [F2] v2.2.0 — Apply permutation before each coupling (except first)
                 if i > 0:
@@ -159,23 +139,17 @@ class ScaleBlock(nn.Module):
 
                 if self.debug:
                     z_before = z_flat.clone()
-
+                
                 z_flat, ld = coupling.forward(z_flat, h, reverse=False)
                 log_det = log_det + ld
-
-                # [A] v2.3.0 — ActNorm after coupling, before next permutation
-                z_flat, ld_an = self.actnorms[i].forward(z_flat, reverse=False)
-                log_det = log_det + ld_an
-
+                
                 if self.debug:
                     logger.debug(f"  Coupling {i+1}/{self.n_layers}:")
                     logger.debug(f"    Output norm: {z_flat.norm().item():.6f}")
                     logger.debug(f"    Log-det: mean={ld.mean().item():.4f}, sum={log_det.mean().item():.4f}")
-
-                    # Per-layer invertibility check — must undo ActNorm before inverting coupling
-                    # [F] v2.3.2: z_flat is post-ActNorm; invert ActNorm first, then coupling
-                    z_after_an_inv, _ = self.actnorms[i].forward(z_flat, reverse=True)
-                    z_test_inv, _ = coupling.forward(z_after_an_inv, h, reverse=True)
+                    
+                    # Per-layer invertibility check
+                    z_test_inv, _ = coupling.forward(z_flat, h, reverse=True)
                     inv_err = (z_before - z_test_inv).abs().max().item()
                     if inv_err > 1e-4:
                         logger.error(f"    ❌ Layer {i+1} invertibility FAILED: error={inv_err:.2e}")
@@ -240,16 +214,10 @@ class ScaleBlock(nn.Module):
             # Apply couplings in reverse order
             for i, coupling in enumerate(reversed(self.coupling_layers)):
                 layer_idx = self.n_layers - 1 - i
-
-                # [F] v2.3.2 — Correct inverse order: ActNorm(rev) → coupling(rev) → inv_perm
-                # Forward was: perm → coupling → ActNorm
-                # So inverse must be: ActNorm(rev) → coupling(rev) → inv_perm
-                z_flat, ld_an = self.actnorms[layer_idx].forward(z_flat, reverse=True)
-                log_det = log_det + ld_an
-
                 z_flat, ld = coupling.forward(z_flat, h, reverse=True)
                 log_det = log_det + ld
 
+                # [F2] v2.2.0 — Undo permutation after inverse coupling (layer_idx > 0)
                 if layer_idx > 0:
                     inv_perm = getattr(self, f'inv_perm_{layer_idx}')
                     z_flat = z_flat[:, inv_perm]
@@ -391,9 +359,9 @@ class ConditionalRealNVP(nn.Module):
             logger.debug(f"  Input x: shape={x.shape}, norm={x.norm().item():.6f}")
             x_original = x.clone()  # For final invertibility check
         
-        # [A2] Input normalization range check — MNIST dequantized+logit with clamp(1e-6) → ~[-13.8, 13.8]
+        # [A2] Input normalization range check — MNIST should be dequantized+logit, ~[-5, 5]
         x_min, x_max = x.min().item(), x.max().item()
-        if x_min < -15.0 or x_max > 15.0:
+        if x_min < -10.0 or x_max > 10.0:
             logger.warning(
                 f"[A2] Input x out of expected range: min={x_min:.3f}, max={x_max:.3f}. "
                 f"Expected dequantized+logit-transformed input in ~[-5,5]. "
