@@ -308,6 +308,9 @@ class ConditionalAffineCoupling(nn.Module):
         # Pool h if spatial (4D tensor: [B, h_dim, H', W'])
         if h.dim() == 4:
             h = torch.mean(h, dim=[2, 3])  # Global average pooling -> [B, h_dim]
+        
+        # DIAG-Z: h norm check
+        logger.warning(f"[DIAG] h.norm mean={h.norm(dim=-1).mean():.2f}, max={h.norm(dim=-1).max():.2f}")
             
         if self.debug:
             logger.debug(f"  Conditioning h: shape={h.shape}, norm={h.norm().item():.6f}")
@@ -358,6 +361,8 @@ class ConditionalAffineCoupling(nn.Module):
         # Same formula as scale: bounded range [-t_max, t_max], gradient never fully vanishes.
         t = self.t_max * t / torch.sqrt(1.0 + t ** 2)
         
+        # DIAG-Z: s/t range check post-clamp
+        logger.warning(f"[DIAG] s range=[{s.min():.4f},{s.max():.4f}], t range=[{t.min():.4f},{t.max():.4f}]")
 
                 
         # [v1.3 DEBUG] Log scale/shift output
@@ -413,6 +418,9 @@ class ConditionalAffineCoupling(nn.Module):
                 x_B_out = (x_B - t) * torch.exp(-s)
                 x_out = torch.cat([x_A, x_B_out], dim=1)
                 log_det = log_det - s.sum(dim=1)
+                
+        # DIAG-Z: x_out explosion check
+        logger.warning(f"[DIAG] x_out mean={x_out.mean():.4e}, std={x_out.std():.4e}, max_abs={x_out.abs().max():.4e}")
 
 
         

@@ -2,19 +2,9 @@
 FiLM (Feature-wise Linear Modulation)
 Applies γ(h) ⊙ f + β(h) transformation with identity initialization
 
-Version: WP0.1-FiLM-v1.1.1
-Last Modified: 2026-03-09
+Version: WP0.1-FiLM-v1.0.3
+Last Modified: 2025-02-04
 Changelog:
-  v1.1.1 (2026-03-09): [F] Softclamp on beta_delta — unconstrained beta_mlp output caused
-                        feature explosion via additive path (beta=5.0×100=500 added to every
-                        hidden unit); same softclamp formula as gamma_delta, bounds beta to
-                        (-scale_factor, scale_factor) = (-5, 5).
-  v1.1.0 (2026-03-08): [F] Softclamp on gamma_delta before scale_factor multiplication —
-                        unconstrained gamma_mlp output could reach ~100, making gamma=501
-                        (scale_factor=5.0 × 100), amplifying features by 501² ≈ 250,000
-                        across 2 FiLM layers causing scale_net NaN overflow; softclamp
-                        bounds gamma_delta to (-1,1) → gamma bounded to (-4,6); beta_delta
-                        unchanged (additive, not multiplicative, safe without clamping).
   v1.0.3 (2025-02-04): Added 4 targeted debug checks: Broadcasting, Order, Range, Weak Conditioning
   v1.0.2 (2025-02-03): Added comprehensive debug steps to diagnose modulation error
   v1.0.1 (2025-02-03): Added identity initialization (gamma=1+δ, beta=δ), configurable scale_factor=0.3
@@ -117,15 +107,6 @@ class FiLM(nn.Module):
         # Compute modulation deltas
         gamma_delta = self.gamma_mlp(h)  # [B, f_dim]
         beta_delta = self.beta_mlp(h)    # [B, f_dim]
-
-        # [F] v1.1.0 — Softclamp gamma_delta to (-1, 1) before scale_factor multiplication.
-        # Bounds gamma to (1-scale_factor, 1+scale_factor) = (-4, 6) with scale_factor=5.0.
-        # Prevents unconstrained gamma_mlp output (~100) → gamma=501 → 501² feature explosion
-        # across stacked FiLM layers causing scale_net NaN. beta_delta is additive — safe.
-        gamma_delta = gamma_delta / torch.sqrt(1.0 + gamma_delta ** 2)
-
-        # [F] v1.1.1 — Softclamp beta_delta to (-1, 1); bounds beta to (-5, 5).
-        beta_delta = beta_delta / torch.sqrt(1.0 + beta_delta ** 2)
         
         # ========== DEBUG CHECK 3: MLP OUTPUT RANGE ==========
         if self.debug:
