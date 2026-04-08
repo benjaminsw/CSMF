@@ -10,10 +10,15 @@ Sections:
   4. preprocess_mnist()           — one-time runner, saves .pt + metadata.json
   5. CLI                          — python scripts/preprocess_mnist.py [--force]
 
-Version: WP0.5-PrepMNIST-v2.1
+Version: WP0.5-PrepMNIST-v2.2
 Abbr: PREP-MNIST
-Last Modified: 2026-02-25
+Last Modified: 2026-03-31
 Changelog:
+  v2.2 (2026-03-31): create_precomputed_dataloaders() accepts worker_init_fn and
+                     generator kwargs — passed through to DataLoader for deterministic
+                     worker seeding; defaults to None (backward compatible); generator
+                     applied to train loader only (shuffle=True); val/test loaders
+                     receive worker_init_fn only (no shuffle, generator not needed)
   v2.1 (2026-02-25): Import degradation params from mnist_config.py — single source of truth
                      Local DEFAULT_* constants kept as fallback only if mnist_config import fails
                      metadata.json now includes config_hash field for cross-stage drift detection
@@ -301,7 +306,9 @@ def create_precomputed_dataloaders(
     preprocessed_dir=DEFAULT_OUT_DIR,
     batch_size=128,
     num_workers=4,
-    config_params=None
+    config_params=None,
+    worker_init_fn=None,
+    generator=None,
 ):
     """
     Build train/val/test DataLoaders from precomputed .pt files.
@@ -314,6 +321,10 @@ def create_precomputed_dataloaders(
         num_workers:       DataLoader worker count
         config_params:     Dict with keys: blur_kernel_size, blur_sigma,
                            downsample_factor, noise_std, normalize, val_split, seed
+        worker_init_fn:    Optional callable(worker_id) for deterministic worker seeds
+                           (v2.2 — use make_worker_init_fn() from mnist_config)
+        generator:         Optional torch.Generator for deterministic shuffling in
+                           train loader (v2.2)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -343,7 +354,9 @@ def create_precomputed_dataloaders(
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+            generator=generator if shuffle else None,  # v2.2: generator only for train (shuffle=True)
         )
 
     logger.info(

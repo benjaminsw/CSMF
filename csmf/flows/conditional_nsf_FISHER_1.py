@@ -1,47 +1,7 @@
-# Version: WP0.3-CondNSF-v2.4
+# Version: WP0.3-CondNSF-v1.6
 # Abbr: COND-NSF
-# Last Modified: 2026-04-06
+# Last Modified: 2026-04-01
 # Changelog:
-#   v2.4 (2026-04-06): [F] Clamp inp after cat and fc1 output before activation —
-#                      cond_half can be large even after h clamp; joint inp clamp
-#                      (-10,10) stops explosion entering fc1; fc1 output clamp (-20,20)
-#                      before ReLU prevents activation amplifying extreme values;
-#                      same pattern applied before fc2 activation; also relax
-#                      nan_rate fatal threshold 0→0.1 in csmf.py eval_expert
-#   v2.3 (2026-04-06): [F] Tighten h clamp (-10,10)→(-3,3) in _compute_params and
-#                      reduce NSFFiLM scale_factor 0.2→0.1, residual_alpha 0.05→0.03 —
-#                      eval_expert NaN persisted after training stabilised; h elements
-#                      up to ±5 still drive FiLM MLP unstable in no_grad eval path;
-#                      tighter h bound + weaker modulation reduces sensitivity
-#   v2.2 (2026-04-05): [F] Increase B 6.0→8.0 and clamp trans_half before spline —
-#                      logit-space input range ~[-13.8,13.8] exceeds B=6.0; inputs
-#                      outside [-B,B] hit linear tail causing NaN gradients in backprop
-#                      even with finite forward; B=8.0 covers most of logit range;
-#                      trans_half clamped to (-B+1e-3, B-1e-3) before spline call
-#                      as hard safety net; same clamp applied in inverse() path
-#   v2.1 (2026-04-05): [F] Activate swap_halves=False for all ConditionalNSF layers —
-#                      v1.6 intended swap_halves=False + permutations but line 368 was
-#                      left as swap_halves=(i%2==1) (alternating); now uncommented to
-#                      match stated design; permutations handle mixing; reduces redundant
-#                      mixing pressure that destabilised _compute_params FiLM path
-#   v2.0 (2026-04-05): [STAB] Three-layer stabilisation for FiLM explosion:
-#                      (1) NSFFiLM scale_factor 0.5→0.2, residual_alpha 0.1→0.05
-#                      — reduces FiLM modulation magnitude;
-#                      (2) NSFFiLM.forward: clamp modulated output after self.base()
-#                      before residual blend — catches overflow from inside FiLM MLP;
-#                      (3) _compute_params: clamp after film1 and film2 as downstream
-#                      safeguard; primary fix is film.py gamma/beta clamp (deploy
-#                      separately); NaN detection upgraded to torch.isfinite()
-#   v1.8 (2026-04-02): [PIPELINE] Removed use_logit, _logit_preprocess, _sigmoid_postprocess
-#                      — csmf._prepare_x_for_expert now applies dequantize+logit for all
-#                      experts uniformly (unified pipeline v1.3.20); NSF forward() receives
-#                      logit-space input directly; inverse() returns logit-space; sigmoid
-#                      applied by csmf._expert_inverse; FI/NLL now comparable across experts
-#   v1.7 (2026-04-02): [LOGIT] Added use_logit flag (default=True) to ConditionalNSF;
-#                      _logit_preprocess() clamps x to (1e-6,1-1e-6) and applies logit,
-#                      accumulates log-det into total; _sigmoid_postprocess() applies
-#                      sigmoid at end of inverse() to recover x_hat_pixel; consistent
-#                      with RealNVP clamp(1e-6) → range ~[-13.8,13.8]
 #   v1.6 (2026-04-01): [PERM] Added random inter-layer permutations to ConditionalNSF —
 #                      num_layers-1 random perms registered as buffers (perm_{i},
 #                      inv_perm_{i}) applied before each coupling layer except layer 0;
@@ -88,8 +48,8 @@ class NSFFiLM(nn.Module):
     FiLM behaviour for RealNVP/NICE or other flows.
     """
 
-    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=0.1,
-                 residual_alpha=0.03, debug=False):
+    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=2.0,
+                 residual_alpha=0.3, debug=False):
         super().__init__()
         self.base = FiLM(
             f_dim=f_dim,
@@ -101,13 +61,8 @@ class NSFFiLM(nn.Module):
         self.residual_alpha = residual_alpha
 
     def forward(self, f, h):
-        f = f.clamp(-20.0, 20.0)
         modulated = self.base(f, h)
-        # v2.0: clamp modulated BEFORE residual blend — catches overflow from
-        # inside FiLM MLP weights; primary fix is gamma/beta clamp in film.py
-        modulated = modulated.clamp(-100.0, 100.0)
-        out = f + self.residual_alpha * (modulated - f)
-        return out.clamp(-50.0, 50.0)
+        return f + self.residual_alpha * (modulated - f)
 
 
 class RationalQuadraticSpline:
@@ -243,7 +198,7 @@ class ConditionalRQSplineCoupling(nn.Module):
     [PERM] v1.6: swap_halves kept for standalone/ablation use; ConditionalNSF sets
     swap_halves=False for all layers and relies on permutations for mixing instead.
     """
-    def __init__(self, dim, cond_dim, hidden=128, K=6, B=8.0, swap_halves=False):
+    def __init__(self, dim, cond_dim, hidden=128, K=6, B=6.0, swap_halves=False):
         super().__init__()
         self.K = K
         self.B = B
@@ -269,37 +224,15 @@ class ConditionalRQSplineCoupling(nn.Module):
         Shared by forward() and inverse() to avoid code duplication.
         cond_half: the half used as conditioner (xA or xB depending on swap_halves).
         """
-        cond_half = cond_half.clamp(-20.0, 20.0)   # my fix
-        
-        if not torch.isfinite(h).all():
-            raise RuntimeError("Non-finite h before normalization in _compute_params")
-
-        # Normalize h to unit norm before clamping — prevents large h_norm (85.6)
-        # from driving FiLM MLP weights to diverge over epochs
-        h = h / h.norm(dim=-1, keepdim=True).clamp(min=1.0)
-        h = h.clamp(-3.0, 3.0)   # v2.3: tightened from (-10,10) — eval NaN fix
-
         inp = torch.cat([cond_half, h], dim=1)
-        # [F] v2.4 — Clamp inp before fc1: cond_half may be large even after h clamp
-        inp = inp.clamp(-10.0, 10.0)
-        out = self.fc1(inp)
-        # [F] v2.4 — Clamp fc1 output before ReLU: prevents activation amplifying extremes
-        out = out.clamp(-20.0, 20.0)
-        out = self.act(out)
-        out = out.clamp(-50.0, 50.0)
+        out = self.act(self.fc1(inp))
         out = self.film1(out, h)
-        out = out.clamp(-50.0, 50.0)   # v2.0: downstream safeguard after film1
-        if not torch.isfinite(out).all():
+        if torch.isnan(out).any() or torch.isinf(out).any():
             logger.error("[COND-NSF] NaN/Inf after film1 in _compute_params")
             raise RuntimeError("NaN/Inf after film1 in _compute_params")
-        out = self.fc2(out)
-        # [F] v2.4 — Clamp fc2 output before ReLU
-        out = out.clamp(-20.0, 20.0)
-        out = self.act(out)
-        out = out.clamp(-50.0, 50.0)
+        out = self.act(self.fc2(out))
         out = self.film2(out, h)
-        out = out.clamp(-50.0, 50.0)   # v2.0: downstream safeguard after film2
-        if not torch.isfinite(out).all():
+        if torch.isnan(out).any() or torch.isinf(out).any():
             logger.error("[COND-NSF] NaN/Inf after film2 in _compute_params")
             raise RuntimeError("NaN/Inf after film2 in _compute_params")
         return self.fc3(out)
@@ -325,9 +258,6 @@ class ConditionalRQSplineCoupling(nn.Module):
         heights     = F.softmax(params[..., self.K:2*self.K], dim=-1) * 2 * self.B
         derivatives = F.softplus(params[..., 2*self.K:]) + 1e-3
 
-        # [F] v2.2 — Clamp trans_half to spline interior before transform.
-        # Inputs outside (-B, B) hit linear tail → NaN gradients in backprop.
-        trans_half = trans_half.clamp(-(self.B - 1e-3), self.B - 1e-3)
         trans_half_new, log_det_B = RationalQuadraticSpline.forward(
             trans_half, widths, heights, derivatives, B=self.B
         )
@@ -362,8 +292,6 @@ class ConditionalRQSplineCoupling(nn.Module):
         heights     = F.softmax(params[..., self.K:2*self.K], dim=-1) * 2 * self.B
         derivatives = F.softplus(params[..., 2*self.K:]) + 1e-3
 
-        # [F] v2.2 — Clamp trans_half to spline interior before inverse.
-        trans_half = trans_half.clamp(-(self.B - 1e-3), self.B - 1e-3)
         trans_half_orig = RationalQuadraticSpline.inverse(
             trans_half, widths, heights, derivatives, B=self.B
         )
@@ -390,7 +318,7 @@ class ConditionalNSF(nn.Module):
     All layers use swap_halves=False — permutations are more general and avoid
     redundant mixing mechanisms.
     """
-    def __init__(self, dim, cond_dim, num_layers=4, hidden=128, K=6, B=8.0):
+    def __init__(self, dim, cond_dim, num_layers=4, hidden=128, K=6, B=6.0):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
@@ -399,8 +327,8 @@ class ConditionalNSF(nn.Module):
         # [PERM] v1.6: all layers swap_halves=False; permutations handle mixing
         layers = []
         for i in range(num_layers):
-            layers.append(ConditionalRQSplineCoupling(dim, cond_dim, hidden, K, B, swap_halves=False))
-            #layers.append(ConditionalRQSplineCoupling(dim, cond_dim, hidden, K, B, swap_halves=(i % 2 == 1)))  # v2.1: deactivated
+            #layers.append(ConditionalRQSplineCoupling(dim, cond_dim, hidden, K, B, swap_halves=False))
+            layers.append(ConditionalRQSplineCoupling(dim, cond_dim, hidden, K, B, swap_halves=(i % 2 == 1)))
         self.layers = nn.ModuleList(layers)
 
         # [PERM] v1.6: register num_layers-1 random permutations as buffers
@@ -413,25 +341,21 @@ class ConditionalNSF(nn.Module):
             self.register_buffer(f"inv_perm_{i}", inv_perm)
 
         logger.info(
-            f"ConditionalNSF v1.8 initialized: dim={dim}, cond_dim={cond_dim}, "
+            f"ConditionalNSF v1.6 initialized: dim={dim}, cond_dim={cond_dim}, "
             f"num_layers={num_layers}, K={K}, B={B}, permutations={num_layers - 1}"
         )
 
     def forward(self, x, h):
         """
-        Forward: x (logit-space, from csmf._prepare_x_for_expert) → z
-        Pattern: coupling_0 → perm_1 → coupling_1 → ...
-
-        Args:
-            x: (B, d) logit-space input — dequantize+logit applied by csmf (unified pipeline)
-            h: (B, cond_dim) conditioning features
+        Forward: x → z
+        Pattern: coupling_0 → perm_1 → coupling_1 → perm_2 → coupling_2 → ...
 
         Returns:
-            z:       (B, d) latent
+            z: (B, d) latent
             log_det: (B,) total log-Jacobian
         """
-        z = x
         log_det = torch.zeros(x.shape[0], device=x.device)
+        z = x
 
         for i, layer in enumerate(self.layers):
             # [PERM] v1.6: permute before each layer except the first
@@ -446,7 +370,7 @@ class ConditionalNSF(nn.Module):
 
     def inverse(self, z, h):
         """
-        Inverse: z → x (logit-space). Sigmoid applied by csmf._expert_inverse.
+        Inverse: z → x
         Pattern (reversed): inv_coupling_N → inv_perm_N → ... → inv_perm_1 → inv_coupling_0
         """
         x = z
@@ -460,9 +384,5 @@ class ConditionalNSF(nn.Module):
             if layer_idx > 0:
                 inv_perm = getattr(self, f"inv_perm_{layer_idx}")
                 x = x[:, inv_perm]
-
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            logger.error("[COND-NSF] NaN/Inf detected after inverse flow")
-            raise RuntimeError("[COND-NSF] NaN/Inf detected after inverse flow")
 
         return x

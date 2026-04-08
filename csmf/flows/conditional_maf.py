@@ -1,10 +1,26 @@
 """
 Conditional Masked Autoregressive Flow (Full MADE Implementation)
 
-Version: WP0.3-CondMAF-v2.2
+Version: WP0.3-CondMAF-v2.4
 Abbr: COND-MAF
-Last Modified: 2026-02-27
+Last Modified: 2026-04-02
 Changelog:
+  v2.5 (2026-04-03): [CONFIG] Default hyperparams updated to standard config:
+                     n_flows 1→2 (two MADE transforms, better expressivity);
+                     hidden_dims [64,64]→[128,128] (~2× more params per MADE);
+                     addresses val NLL gap caused by under-capacity at 784-dim;
+                     use_reverse_order remains False; no logic changes
+  v2.4 (2026-04-02): [CONFIG] Default hyperparams updated to lean ablation config:
+                     n_flows 2→1 (single MADE transform, faster, less expressive);
+                     hidden_dims [128,128]→[64,64] (~2× fewer params per MADE layer);
+                     use_reverse_order True→False (no alternating order with 1 flow);
+                     __main__ test block updated to reflect new defaults; no logic changes
+  v2.3 (2026-03-16): [SPEED] Fix1: MADE.precompute_film(h)+forward_with_cached_film() cut
+                     FiLM recompute from 784×/flow to 1×/flow in inverse() D-loop; Fix2:
+                     h_proj pre-allocated in MADE.__init__ via input_h_dim param — removes
+                     lazy runtime init that broke DataParallel and created on wrong device;
+                     Fix3: sample() batch loop replaced with single batched inverse() call
+                     (B×n_samples flattened) — removes Python loop overhead
   v2.2 (2026-02-27): [SPEED] Default n_flows reduced 4→2 (~2× faster forward+inverse);
                      default hidden_dims reduced [256,256]→[128,128] (~1.5–2× faster forward);
                      changes are defaults only — callers can still override; version tracking
@@ -236,23 +252,33 @@ class MADE(nn.Module):
         input_dim: int,
         hidden_dims: List[int],
         conditioning_dim: int = 0,
-        use_film: bool = True
+        use_film: bool = True,
+        input_h_dim: Optional[int] = None
     ):
         """
         Initialize MADE network.
-        
+
         Args:
             input_dim: Data dimensionality D
             hidden_dims: List of hidden layer sizes (e.g., [256, 256])
-            conditioning_dim: Dimension of conditioning features h
+            conditioning_dim: Dimension of conditioning features h expected internally
             use_film: Whether to use FiLM for conditioning
+            input_h_dim: Actual dim of incoming h. If provided and != conditioning_dim,
+                         h_proj is pre-allocated here (Fix 2 — removes lazy runtime init).
         """
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dims = hidden_dims
         self.conditioning_dim = conditioning_dim
         self.use_film = use_film
+
+        # [Fix 2] Pre-allocate h_proj to avoid lazy init breaking DataParallel / device placement
+        if conditioning_dim > 0 and input_h_dim is not None and input_h_dim != conditioning_dim:
+            self.h_proj: Optional[nn.Linear] = nn.Linear(input_h_dim, conditioning_dim)
+            logger.info(f"MADE: pre-allocated h_proj {input_h_dim} -> {conditioning_dim}")
+        else:
+            self.h_proj = None
         
         # Output dimension: D values for mu, D values for log_sigma
         self.output_dim = 2 * input_dim
@@ -305,22 +331,29 @@ class MADE(nn.Module):
             logger.error("Conditioning features h required but not provided")
             raise ValueError("Conditioning features h required when conditioning_dim > 0")
         
-        # --- Adapt conditioning h to [B, conditioning_dim] if needed ---
+        # --- Adapt conditioning h to [B, conditioning_dim] ---
         if h is not None:
-            # If h is spatial (e.g. MNIST image), pool to [B, C]
-            if h.dim() == 4:  # [B, C, H, W]
-                h = h.mean(dim=(2, 3))  # -> [B, C]
+            # Spatial h (e.g. MNIST image): pool to [B, C]
+            if h.dim() == 4:
+                h = h.mean(dim=(2, 3))
 
-            # Ensure h is 2D now
             if h.dim() != 2:
-                raise RuntimeError(f"MADE expects h as [B, h_dim] (or [B,C,H,W]), got {h.shape}")
+                logger.error(f"MADE expects h as [B, h_dim] or [B,C,H,W], got {h.shape}")
+                raise RuntimeError(f"MADE h shape invalid: {h.shape}")
 
-            # If channel dim != conditioning_dim, project it
+            # [Fix 2] Use pre-allocated h_proj; raise on unexpected mismatch (no lazy init)
             if self.conditioning_dim > 0 and h.shape[1] != self.conditioning_dim:
-                # Create projection lazily the first time we see this mismatch
-                if not hasattr(self, "h_proj") or self.h_proj is None:
-                    self.h_proj = nn.Linear(h.shape[1], self.conditioning_dim).to(h.device)
-                h = self.h_proj(h)
+                if self.h_proj is not None:
+                    h = self.h_proj(h)
+                else:
+                    logger.error(
+                        f"h dim mismatch: got {h.shape[1]}, expected {self.conditioning_dim}. "
+                        f"Pass input_h_dim={h.shape[1]} to MADE.__init__ to enable projection."
+                    )
+                    raise RuntimeError(
+                        f"h dim mismatch ({h.shape[1]} != {self.conditioning_dim}). "
+                        f"Pre-allocate h_proj via input_h_dim in MADE.__init__."
+                    )
         # --- end conditioning adapter ---
                 
         
@@ -347,7 +380,7 @@ class MADE(nn.Module):
         mu, log_sigma = torch.chunk(out, 2, dim=1)
         
         # Clamp log_sigma for numerical stability
-        log_sigma = torch.clamp(log_sigma, min=-10, max=10)
+        log_sigma = torch.clamp(log_sigma, min=-5, max=5)
         
         # Check for NaN
         if torch.isnan(mu).any() or torch.isnan(log_sigma).any():
@@ -356,6 +389,89 @@ class MADE(nn.Module):
             logger.error(f"log_sigma: min={log_sigma.min():.3f}, max={log_sigma.max():.3f}, nan={torch.isnan(log_sigma).sum()}")
             raise RuntimeError("NaN detected in MADE output")
         
+        return mu, log_sigma
+
+    # ------------------------------------------------------------------ #
+    # Fix 1: FiLM pre-cache API                                           #
+    # ------------------------------------------------------------------ #
+    def precompute_film(self, h: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Pre-compute FiLM (gamma, beta) for every hidden layer from h.
+
+        Call ONCE per flow step before entering the autoregressive D-loop in
+        inverse(). Cuts FiLM conditioning-net calls from D×n_layers to
+        2×n_layers (two dummy passes per layer to isolate gamma and beta).
+
+        Strategy (no FiLM internals required):
+            FiLM(x, h) = gamma(h) * x + beta(h)
+            beta  = FiLM(0, h)
+            gamma = FiLM(1, h) - beta
+
+        Args:
+            h: Conditioning vector, shape (B, conditioning_dim).
+
+        Returns:
+            List of (gamma, beta) tensors, one tuple per hidden layer.
+            Empty list if use_film is False.
+        """
+        if not self.use_film or self.film_layers is None:
+            return []
+
+        film_params: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for i, film_layer in enumerate(self.film_layers):
+            h_dim_i = self.hidden_dims[i]
+            zeros = torch.zeros(h.shape[0], h_dim_i, device=h.device, dtype=h.dtype)
+            ones  = torch.ones( h.shape[0], h_dim_i, device=h.device, dtype=h.dtype)
+            beta  = film_layer(zeros, h)
+            gamma = film_layer(ones,  h) - beta
+            if torch.isnan(gamma).any() or torch.isnan(beta).any():
+                logger.error(f"NaN in precompute_film at hidden layer {i}")
+                raise RuntimeError(f"NaN in precompute_film layer {i}")
+            film_params.append((gamma, beta))
+            logger.debug(f"precompute_film layer {i}: gamma norm={gamma.norm():.4f}, beta norm={beta.norm():.4f}")
+
+        return film_params
+
+    def forward_with_cached_film(
+        self,
+        x: torch.Tensor,
+        film_params: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass using pre-computed FiLM params (avoids recomputing h-dependent
+        conditioning net on every step of the autoregressive D-loop).
+
+        Used exclusively by ConditionalMAF.inverse() inside the D-loop.
+
+        Args:
+            x: Masked input tensor, shape (B, input_dim).
+            film_params: Output of precompute_film(h) — list of (gamma, beta) per layer.
+
+        Returns:
+            mu, log_sigma: shape (B, input_dim) each.
+        """
+        if self.use_film and len(film_params) != len(self.layers) - 1:
+            logger.error(
+                f"film_params length {len(film_params)} != n_hidden_layers {len(self.layers)-1}"
+            )
+            raise RuntimeError("film_params length mismatch — call precompute_film first")
+
+        out = x
+        for i, layer in enumerate(self.layers[:-1]):
+            out = layer(out)
+            out = self.activation(out)
+            if self.use_film and film_params:
+                gamma, beta = film_params[i]
+                out = gamma * out + beta
+
+        out = self.layers[-1](out)
+        mu, log_sigma = torch.chunk(out, 2, dim=1)
+        log_sigma = torch.clamp(log_sigma, min=-5, max=5)
+
+        if torch.isnan(mu).any() or torch.isnan(log_sigma).any():
+            logger.error("NaN detected in MADE forward_with_cached_film output")
+            raise RuntimeError("NaN in forward_with_cached_film output")
+
         return mu, log_sigma
 
 
@@ -383,7 +499,7 @@ class ConditionalMAF(nn.Module):
         n_flows: int = 2,
         hidden_dims: List[int] = None,
         use_batch_norm: bool = True,
-        use_reverse_order: bool = True,
+        use_reverse_order: bool = False,
         config: dict = None
     ):
         """
@@ -405,8 +521,8 @@ class ConditionalMAF(nn.Module):
             h_dim = cond_dim
         
         # Version tracking
-        self.version = "WP0.3-CondMAF-v2.2"
-        self.abbr = "COND-MAF-SPEED"
+        self.version = "WP0.3-CondMAF-v2.5"
+        self.abbr = "COND-MAF"
         logger.info(f"Initializing {self.__class__.__name__} version {self.version}")
         
         # Use config if provided
@@ -470,7 +586,8 @@ class ConditionalMAF(nn.Module):
                 input_dim=dim,
                 hidden_dims=hidden_dims,
                 conditioning_dim=h_dim,
-                use_film=True
+                use_film=True,
+                input_h_dim=h_dim   # [Fix 2] pre-allocate h_proj if dims ever diverge
             )
             self.flows.append(made)
             logger.info(f"Created MADE flow {k+1}/{n_flows}")
@@ -620,15 +737,22 @@ class ConditionalMAF(nn.Module):
         try:
             if h is not None:
                 h_source = "external"
-            elif self._cached_h is not None:
+            elif self._cached_h is not None and self._cached_h.shape[0] == batch_size:
                 h = self._cached_h
                 h_source = "cached"
             else:
-                logger.warning(
-                    "MAF inverse(): no external h and no cached h — recomputing from "
-                    "self.conditioner(y). This may cause forward/inverse h mismatch. "
-                    "Pass h= from CSMF's conditioner."
-                )
+                if self._cached_h is not None and self._cached_h.shape[0] != batch_size:
+                    logger.warning(
+                        f"MAF inverse(): _cached_h batch size {self._cached_h.shape[0]} != "
+                        f"z batch size {batch_size} — recomputing from self.conditioner(y). "
+                        f"This is expected when sample() flattens (B x n_samples)."
+                    )
+                else:
+                    logger.warning(
+                        "MAF inverse(): no external h and no cached h — recomputing from "
+                        "self.conditioner(y). This may cause forward/inverse h mismatch. "
+                        "Pass h= from CSMF's conditioner."
+                    )
                 h = self.conditioner(y)
                 h_source = "recomputed"
             logger.debug(f"MAF inverse: h source={h_source}, norm={h.norm().item():.4f}")
@@ -645,11 +769,14 @@ class ConditionalMAF(nn.Module):
             if self.use_batch_norm:
                 x = self.batch_norms[flow_idx].inverse(x)
             
+            # [Fix 1] Pre-compute FiLM gamma/beta once per flow — cuts FiLM calls 784× → 1×
+            film_params = self.flows[flow_idx].precompute_film(h)
+
             # MADE inverse: MUST be sequential
             # We need to compute dimension by dimension because dimension i
             # depends on dimensions 0...i-1 which must be computed first
             x_new = torch.zeros_like(x)
-            
+
             for i in range(self.dim):
                 # Get previous dimensions in the CURRENT ordering
                 if i == 0:
@@ -658,14 +785,17 @@ class ConditionalMAF(nn.Module):
                     x_prev = x_new[:, :i] if i > 0 else x_prev[:, :0]
                 else:
                     x_prev = x_new[:, :i]
-                
+
                 # Compute conditional parameters using MADE
                 # We need to mask the input to only see dimensions < i
                 x_masked = x_new.clone()
                 x_masked[:, i:] = 0  # Mask future dimensions
-                
+
                 try:
-                    mu_all, log_sigma_all = self.flows[flow_idx](x_masked, h)
+                    # [Fix 1] Use cached FiLM — no h recompute inside loop
+                    mu_all, log_sigma_all = self.flows[flow_idx].forward_with_cached_film(
+                        x_masked, film_params
+                    )
                     mu_i = mu_all[:, i:i+1]
                     log_sigma_i = log_sigma_all[:, i:i+1]
                 except Exception as e:
@@ -699,52 +829,49 @@ class ConditionalMAF(nn.Module):
     def sample(self, n_samples: int, y: torch.Tensor) -> torch.Tensor:
         """
         Generate samples from the conditional distribution.
-        
+
         Args:
-            n_samples: Number of samples to generate
-            y: Measurements for conditioning, shape (1, 1, 28, 28) or (batch, 1, 28, 28)
-            
+            n_samples: Number of samples to generate per conditioning.
+            y: Measurements for conditioning, shape (1, 1, 28, 28) or (B, 1, 28, 28).
+
         Returns:
-            x: Samples, shape (n_samples, dim) or (batch, n_samples, dim)
+            x: Samples, shape (n_samples, dim) for B=1, or (B, n_samples, dim) for B>1.
         """
-        # Handle batch dimension in y
-        if y.shape[0] == 1:
-            # Single conditioning: generate n_samples
-            # Sample from base distribution N(0, I)
-            z = torch.randn(n_samples, self.dim, device=y.device)
-            
-            # Expand y to match n_samples
-            y_expanded = y.expand(n_samples, -1, -1, -1)
-            
-            # Transform to data space
-            x = self.inverse(z, y_expanded)
-            
-            return x
-        else:
-            # Multiple conditionings: generate n_samples for each
-            batch_size = y.shape[0]
-            
-            # Sample from base distribution
-            z = torch.randn(batch_size, n_samples, self.dim, device=y.device)
-            
-            # Process each batch element
-            samples = []
-            for i in range(batch_size):
-                y_i = y[i:i+1].expand(n_samples, -1, -1, -1)
-                x_i = self.inverse(z[i], y_i)
-                samples.append(x_i)
-            
-            return torch.stack(samples)
+        batch_size = y.shape[0]
+        total = batch_size * n_samples
+
+        z = torch.randn(total, self.dim, device=y.device)
+
+        # Expand y: (B, C, H, W) -> (B*n_samples, C, H, W)
+        y_expanded = (
+            y.unsqueeze(1)
+             .expand(-1, n_samples, -1, -1, -1)
+             .reshape(total, *y.shape[1:])
+        )
+
+        # [Fix] Compute h once here and pass to inverse() — avoids recompute warning
+        # that fires when _cached_h batch size != total (B*n_samples)
+        try:
+            h = self.conditioner(y_expanded)
+        except Exception as e:
+            logger.error(f"sample(): conditioner failed: {e}")
+            raise
+
+        x_flat = self.inverse(z, y_expanded, h=h)
+
+        if batch_size == 1:
+            return x_flat
+        return x_flat.view(batch_size, n_samples, self.dim)
 
 
 # Version check function
 def get_version():
     """Return version information."""
     return {
-        'version': 'WP0.3-CondMAF-v2.2',
-        'abbr': 'COND-MAF-SPEED',
-        'date': '2026-02-27',
-        'purpose': 'Speed-optimised MAF: n_flows=2, hidden_dims=[128,128]',
+        'version': 'WP0.3-CondMAF-v2.5',
+        'abbr': 'COND-MAF',
+        'date': '2026-04-03',
+        'purpose': 'Standard config: n_flows=2, hidden_dims=[128,128] — better expressivity for 784-dim MNIST',
         'improvements': [
             'MADE masking mechanism',
             'Parallel computation (O(D) forward)',
@@ -752,7 +879,10 @@ def get_version():
             'Batch normalization',
             'Order reversal between layers',
             'Triangular Jacobian optimization',
-            'Efficient gradient flow'
+            'Efficient gradient flow',
+            '[v2.3] FiLM pre-cache (precompute_film + forward_with_cached_film)',
+            '[v2.3] h_proj pre-allocated in MADE.__init__ (input_h_dim param)',
+            '[v2.3] sample() vectorised — single batched inverse() call',
         ]
     }
 
@@ -774,7 +904,7 @@ if __name__ == "__main__":
             n_flows=2,
             hidden_dims=[128, 128],
             use_batch_norm=True,
-            use_reverse_order=True
+            use_reverse_order=False
         )
         logger.info("✓ Model instantiation successful")
         

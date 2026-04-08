@@ -1,49 +1,7 @@
 # =============================================================================
-# Version: WP3.1-CSMF-v1.3.29 | Abbr: CSMF-MAIN
+# Version: WP3.1-CSMF-v1.3.22 | Abbr: CSMF-MAIN
 # Description: Conditional Sequential Mixture of Flows — main model class
 # Changelog:
-#   v1.3.29 (2026-04-07): [DIAG-OUTPUT] Per-component loss tracking in Stage B + C —
-#                         epoch_logs gains nll_loss, cons_loss, trans_loss, cal_loss
-#                         lists populated each epoch from loss_dict returned by
-#                         hybrid_loss(); all four keys use safe .get(key, 0.0) to
-#                         handle missing components (e.g. SW2 disabled); consumed by
-#                         SB-DIAG v1.1 and SC-DIAG v2.1 P_loss_components plots
-#   v1.3.28 (2026-04-06): [GCSF-STAB] Two GlowCSF-gated Stage A additions —
-#                         (1) grad clipping max_norm=1.0 applied only to
-#                         ConditionalGlowCSF before optimizer.step() — existing
-#                         clip_grad_norm_(max_norm=1.0) runs for all experts after
-#                         NaN check; GlowCSF gets an additional pre-check clip at
-#                         max_norm=1.0 to catch finite-but-exploding grads before
-#                         they become NaN in next forward pass; other flows unaffected.
-#                         (2) NaN param names logged once per expert per run for
-#                         GlowCSF — identifies spline/FiLM vs log_s/linear source.
-#   v1.3.27 (2026-04-06): [INV-PERSIST] Non-fatal invertibility violation tracking —
-#                         eval_expert no longer raises on inv_err > 1e-2; returns
-#                         inv_fatal=True flag instead; train_stage_A tracks per-expert
-#                         consecutive violation count (_inv_violations dict); hard raise
-#                         only if >=3 consecutive epochs FATAL or inv_err > 5e-2
-#                         (catastrophic); Newton diagnostic logged on first FATAL:
-#                         max residual, frac>1e-3/1e-2, boundary clustering (y<0.05
-#                         or y>0.95) to inform Blinn solver decision (deferred to v1.1)
-#   v1.3.26 (2026-04-06): [F] Relax eval_expert nan_rate fatal threshold 0→0.1 —
-#                         NSF trains stably (NaN_batches=0) but 6.4% of val batches
-#                         hit edge NaN in eval; threshold >0 is too strict for NSF
-#                         with logit-space inputs near spline boundaries; >0.1 still
-#                         catches truly dead experts while allowing marginal instability
-#   v1.3.25 (2026-04-05): [F] Skip batch on NaN gradients instead of zeroing —
-#                         replaces zero-grad approach (v1.3.25 original) which caused
-#                         log spam and wasted optimizer steps when all 120 NSF params
-#                         had NaN grads; now counts NaN grad params, logs warning once,
-#                         increments n_nan_batches and skips opt_k.step() via continue
-#   v1.3.24 (2026-04-04): BUG FIX — train_stage_A() lazy import changed from
-#                         fisher_info_diag to metric_utils; fisher_info_diag will
-#                         be deleted; import path now:
-#                         from csmf.evaluation.metric_utils import compute_fi_option_a_batch
-#   v1.3.23 (2026-04-04): [DIAG-REORG] Add tau per-epoch to train_stage_B() epoch_logs
-#                         — epoch_logs["tau"] initialised as [] alongside other keys;
-#                         tau appended once per epoch after gate_weights append;
-#                         satisfies StageBEpochLogs contract (LS v1.0) required by
-#                         SB-DIAG v1.0 P4 (tau over epochs plot); docstring updated
 #   v1.3.22 (2026-04-03): [SC-DIAG] Enrich train_stage_C() epoch_logs for new plots —
 #                         added gate_weights (K-dim mean per epoch), residual (scalar
 #                         ‖Ax̂-y‖² per epoch from first val batch), recon_snapshots
@@ -601,9 +559,6 @@ class CSMF(nn.Module):
         # [v1.3.7] Collect epoch logs for EXP-SANITY
         epoch_logs: Dict[str, Dict[str, list]] = {}
 
-        # [INV-PERSIST] Per-expert consecutive inv_err FATAL violation counter
-        _inv_violations: Dict[int, int] = {}
-
         for k, expert in enumerate(self.experts):
             expert_name = type(expert).__name__  # [L1] e.g. ConditionalMAF, ConditionalRealNVP
             k_display = k + 1 
@@ -690,42 +645,6 @@ class CSMF(nn.Module):
                         continue
 
                     loss.backward()
-                    # [F] v1.3.25 — Skip batch if NaN gradients detected.
-                    # NaN grads bypass clip_grad_norm_; stepping with them corrupts
-                    # weights. Count affected params, log once, skip via continue.
-
-                    # [F] v1.3.28 — GlowCSF: clip finite-but-exploding grads before
-                    # NaN check; large grads can become NaN in next forward pass.
-                    # Gated to GlowCSF only — other flows train stably without this.
-                    from csmf.flows.conditional_glow_csf import ConditionalGlowCSF as _GCSF
-                    if isinstance(expert, _GCSF):
-                        torch.nn.utils.clip_grad_norm_(
-                            expert.parameters(), max_norm=1.0
-                        )
-
-                    nan_grad_params = sum(
-                        1 for p in expert.parameters()
-                        if p.grad is not None and not torch.isfinite(p.grad).all()
-                    )
-                    if nan_grad_params > 0:
-                        # [F] v1.3.28 — Log NaN param names once per expert per run
-                        # for GlowCSF to identify spline/FiLM vs log_s/linear source.
-                        if isinstance(expert, _GCSF) and not getattr(expert, '_nan_names_logged', False):
-                            nan_names = [
-                                n for n, p in expert.named_parameters()
-                                if p.grad is not None and not torch.isfinite(p.grad).all()
-                            ]
-                            logger.error(
-                                f"Stage A | expert={k_display} ({expert_name}) | "
-                                f"NaN grad param names (first occurrence): {nan_names[:10]}"
-                            )
-                            expert._nan_names_logged = True
-                        logger.warning(
-                            f"Stage A | expert={k_display} ({expert_name}) | "
-                            f"epoch={epoch+1} | NaN grads in {nan_grad_params} params — skipping batch"
-                        )
-                        n_nan_batches += 1
-                        continue
                     torch.nn.utils.clip_grad_norm_(
                         expert.parameters(), max_norm=1.0
                     )
@@ -811,7 +730,7 @@ class CSMF(nn.Module):
                 # must re-enable expert params afterwards so next epoch can train.
                 if val_loader is not None:
                     try:
-                        from csmf.evaluation.metric_utils import compute_fi_option_a_batch  # [BF] v1.3.24: was fisher_info_diag
+                        from csmf.evaluation.fisher_info_diag import compute_fi_option_a_batch
                         expert.eval()
                         _vx, _vy = next(iter(val_loader))
                         _vx, _vy = _vx.to(self.device), _vy.to(self.device)
@@ -846,42 +765,7 @@ class CSMF(nn.Module):
             # v1.3: eval_expert — fatal raise on fail, stops before Stage B
             if val_loader is not None:
                 fwd = fwd_model if fwd_model is not None else hybrid_loss.A
-                eval_result = self.eval_expert(k_display, expert, val_loader, fwd)
-                # [INV-PERSIST] Track consecutive FATAL violations per expert
-                if eval_result.get("inv_fatal", False):
-                    _inv_violations[k_display] = _inv_violations.get(k_display, 0) + 1
-                    inv_err_val = eval_result.get("invertibility_err", float("nan"))
-                    n_viol = _inv_violations[k_display]
-                    logger.warning(
-                        f"train_stage_A | expert={k_display} | inv_fatal violation "
-                        f"{n_viol}/3 | inv_err={inv_err_val:.2e}"
-                    )
-                    if inv_err_val > 5e-2:
-                        logger.error(
-                            f"train_stage_A | expert={k_display} | "
-                            f"inv_err={inv_err_val:.2e} > 5e-2 — CATASTROPHIC, raising"
-                        )
-                        raise ValueError(
-                            f"eval_expert: expert {k_display} catastrophic invertibility "
-                            f"error: {inv_err_val:.2e}"
-                        )
-                    if n_viol >= 3:
-                        logger.error(
-                            f"train_stage_A | expert={k_display} | "
-                            f"inv_fatal for {n_viol} consecutive evals — raising"
-                        )
-                        raise ValueError(
-                            f"eval_expert: expert {k_display} persistent invertibility "
-                            f"failure ({n_viol} consecutive): {inv_err_val:.2e}"
-                        )
-                else:
-                    # Reset on clean eval
-                    if k_display in _inv_violations:
-                        logger.info(
-                            f"train_stage_A | expert={k_display} | "
-                            f"inv_err clean — resetting violation counter"
-                        )
-                    _inv_violations[k_display] = 0
+                self.eval_expert(k_display, expert, val_loader, fwd)
 
         # Freeze all expert parameters
         for expert in self.experts:
@@ -933,7 +817,7 @@ class CSMF(nn.Module):
             tau_end:     [NR] v1.3.14 gate temperature at final epoch (linear annealing)
 
         Returns:
-            epoch_logs: Dict with train_loss, val_loss, neff, gate_weights, tau lists
+            epoch_logs: Dict with train_loss, val_loss, neff, gate_weights lists
         """
         # Sanity-check expert freeze
         for k, expert in enumerate(self.experts):
@@ -948,11 +832,6 @@ class CSMF(nn.Module):
             f"=== Stage B | gate training | epochs={epochs} | "
             f"lambda_neff={lambda_neff} | tau={tau_start}→{tau_end} ==="
         )
-        
-        # [BF] Restore gate grad — Stage A FI helper may leave gate params frozen
-        for p in self.gate.parameters():
-            p.requires_grad_(True)
-    
         self.gate.train()
 
         best_val_loss    = float("inf")
@@ -966,11 +845,6 @@ class CSMF(nn.Module):
             "val_loss":     [],
             "neff":         [],
             "gate_weights": [],
-            "tau":          [],   # [DIAG-REORG] v1.3.23: per-epoch tau for SB-DIAG P4
-            "nll_loss":     [],   # [v1.3.29] per-epoch mean NLL component
-            "cons_loss":    [],   # [v1.3.29] per-epoch mean consistency component
-            "trans_loss":   [],   # [v1.3.29] per-epoch mean SW2 transport component
-            "cal_loss":     [],   # [v1.3.29] per-epoch mean calibration component
         }
 
         for epoch in range(epochs):
@@ -981,10 +855,6 @@ class CSMF(nn.Module):
             total_neff         = 0.0
             total_gate_weights = torch.zeros(len(self.experts), device=self.device)
             n_batches          = 0
-            total_nll          = 0.0   # [v1.3.29] per-component accumulators
-            total_cons         = 0.0
-            total_trans        = 0.0
-            total_cal          = 0.0
 
             for x_clean, y_deg in dataloader:
                 x_clean = x_clean.to(self.device)
@@ -1023,12 +893,8 @@ class CSMF(nn.Module):
                     neff = self._compute_neff(w).mean().item()
                     total_gate_weights += w.mean(dim=0)
 
-                total_loss  += loss.item()
-                total_neff  += neff
-                total_nll   += loss_dict.get("nll",   0.0)   # [v1.3.29]
-                total_cons  += loss_dict.get("cons",  0.0)   # [v1.3.29]
-                total_trans += loss_dict.get("trans", 0.0)   # [v1.3.29]
-                total_cal   += loss_dict.get("cal",   0.0)   # [v1.3.29]
+                total_loss += loss.item()
+                total_neff += neff
                 n_batches  += 1
 
                 # [BL] v1.3.16: batch-level heartbeat
@@ -1051,11 +917,6 @@ class CSMF(nn.Module):
             epoch_logs["train_loss"].append(avg_loss)
             epoch_logs["neff"].append(avg_neff)
             epoch_logs["gate_weights"].append(avg_gate_weights)
-            epoch_logs["tau"].append(tau)   # [DIAG-REORG] v1.3.23
-            epoch_logs["nll_loss"].append(total_nll   / n_batches)   # [v1.3.29]
-            epoch_logs["cons_loss"].append(total_cons  / n_batches)   # [v1.3.29]
-            epoch_logs["trans_loss"].append(total_trans / n_batches)  # [v1.3.29]
-            epoch_logs["cal_loss"].append(total_cal   / n_batches)   # [v1.3.29]
 
             logger.info(
                 f"Stage B | Epoch {epoch+1}/{epochs} | tau={tau:.3f} | "
@@ -1303,10 +1164,6 @@ class CSMF(nn.Module):
             "gate_weights":    [],   # [v1.3.22] K-dim mean gate weight per epoch
             "residual":        [],   # [v1.3.22] ‖Ax̂-y‖² scalar per epoch (val batch)
             "recon_snapshots": [],   # [v1.3.22] (y, x_hat) pairs every recon_every epochs
-            "nll_loss":        [],   # [v1.3.29] per-epoch mean NLL component
-            "cons_loss":       [],   # [v1.3.29] per-epoch mean consistency component
-            "trans_loss":      [],   # [v1.3.29] per-epoch mean SW2 transport component
-            "cal_loss":        [],   # [v1.3.29] per-epoch mean calibration component
         }
         _recon_every   = 5   # snapshot every N epochs
         _max_snapshots = 6   # cap memory usage
@@ -1317,13 +1174,9 @@ class CSMF(nn.Module):
                 epoch / max(epochs - 1, 1)
             )
 
-            total_loss  = 0.0
-            total_neff  = 0.0
-            n_batches   = 0
-            total_nll   = 0.0   # [v1.3.29]
-            total_cons  = 0.0   # [v1.3.29]
-            total_trans = 0.0   # [v1.3.29]
-            total_cal   = 0.0   # [v1.3.29]
+            total_loss = 0.0
+            total_neff = 0.0
+            n_batches  = 0
 
             for x_clean, y_deg in dataloader:
                 x_clean = x_clean.to(self.device)
@@ -1351,12 +1204,8 @@ class CSMF(nn.Module):
                     # [v1.3.22] accumulate gate weights for epoch mean
                     w_mean_batch = w.mean(dim=0).cpu()
 
-                total_loss  += loss.item()
-                total_neff  += neff
-                total_nll   += loss_dict.get("nll",   0.0)   # [v1.3.29]
-                total_cons  += loss_dict.get("cons",  0.0)   # [v1.3.29]
-                total_trans += loss_dict.get("trans", 0.0)   # [v1.3.29]
-                total_cal   += loss_dict.get("cal",   0.0)   # [v1.3.29]
+                total_loss += loss.item()
+                total_neff += neff
                 n_batches  += 1
                 if n_batches == 1:
                     total_gate_w = w_mean_batch
@@ -1376,11 +1225,7 @@ class CSMF(nn.Module):
             epoch_logs["train_loss"].append(avg_loss)
             epoch_logs["neff"].append(avg_neff)
             epoch_logs["tau"].append(tau)
-            epoch_logs["gate_weights"].append(avg_gate_w)          # [v1.3.22]
-            epoch_logs["nll_loss"].append(total_nll   / n_batches) # [v1.3.29]
-            epoch_logs["cons_loss"].append(total_cons  / n_batches) # [v1.3.29]
-            epoch_logs["trans_loss"].append(total_trans / n_batches)# [v1.3.29]
-            epoch_logs["cal_loss"].append(total_cal   / n_batches)  # [v1.3.29]
+            epoch_logs["gate_weights"].append(avg_gate_w)   # [v1.3.22]
 
             logger.info(
                 f"Stage C | Epoch {epoch+1}/{epochs} | Loss={avg_loss:.4f} | "
@@ -1599,47 +1444,14 @@ class CSMF(nn.Module):
             f"nan_rate={nan_rate:.3f}"
         )
 
-        if nan_rate > 0.1:
-            _log.error(f"eval_expert | expert={k} | nan_rate={nan_rate:.3f} > 0.1 — FATAL")
+        if nan_rate > 0:
+            _log.error(f"eval_expert | expert={k} | nan_rate={nan_rate:.3f} > 0 — FATAL")
             raise ValueError(f"eval_expert: expert {k} has nan_rate={nan_rate:.3f}")
         # Threshold is image-space wrapped (sigmoid applied) — not exact flow invertibility.
         # Direct logit-space inv_err=8.48e-08; sigmoid wrapping adds ~1e-3 numerical noise.
-        inv_fatal = False
-        if inv_err_mean > 5e-3:
-            _log.warning(f"eval_expert | expert={k} | inv_err={inv_err_mean:.2e} > 5e-3 — WARN")
-        if inv_err_mean > 1e-2:
-            _log.error(f"eval_expert | expert={k} | inv_err={inv_err_mean:.2e} > 1e-2 — FATAL (non-raising, tracked)")
-            inv_fatal = True
-            # [INV-PERSIST] Newton diagnostic — inform Blinn solver decision
-            try:
-                # Re-run one val batch for residual diagnostics
-                x_clean_d, y_deg_d = next(iter(val_loader))
-                x_clean_d = x_clean_d.to(self.device)
-                y_deg_d   = y_deg_d.to(self.device)
-                h_d = self.conditioner(y_deg_d)
-                x_in_d = self._prepare_x_for_expert(expert, x_clean_d)
-                z_d, _, _, z_flist_d = self._expert_forward(expert, x_clean_d, y_deg_d, h_d, x_in=x_in_d)
-                x_recon_d = self._expert_inverse(expert, z_d, y_deg_d, h_d, z_factored_list=z_flist_d)
-                x_ref_d   = torch.sigmoid(x_in_d)
-                if x_recon_d.shape != x_ref_d.shape:
-                    x_recon_d = x_recon_d.view_as(x_ref_d)
-                residuals_d   = (x_recon_d - x_ref_d).abs()
-                res_max       = residuals_d.max().item()
-                frac_1e3      = (residuals_d > 1e-3).float().mean().item()
-                frac_1e2      = (residuals_d > 1e-2).float().mean().item()
-                # Boundary clustering: bad residuals near y≈0 or y≈1
-                bad_mask      = residuals_d > 1e-2
-                if bad_mask.any():
-                    near_bnd  = ((x_ref_d[bad_mask] < 0.05) | (x_ref_d[bad_mask] > 0.95)).float().mean().item()
-                else:
-                    near_bnd  = float("nan")
-                _log.error(
-                    f"eval_expert | expert={k} | Newton diag | "
-                    f"res_max={res_max:.2e} | frac>1e-3={frac_1e3:.3f} | "
-                    f"frac>1e-2={frac_1e2:.3f} | near_boundary={near_bnd:.3f}"
-                )
-            except Exception as diag_e:
-                _log.error(f"eval_expert | expert={k} | Newton diag failed: {diag_e}")
+        if inv_err_mean > 1e-2: #5e-3:
+            _log.error(f"eval_expert | expert={k} | inv_err={inv_err_mean:.2e} > 5e-3 — FATAL")
+            raise ValueError(f"eval_expert: expert {k} invertibility error too large: {inv_err_mean:.2e}")
         if h_norm_mean < 0.01:
             _log.error(f"eval_expert | expert={k} | h_norm={h_norm_mean:.4f} < 0.01 — dead conditioner FATAL")
             raise ValueError(f"eval_expert: expert {k} dead conditioner h_norm={h_norm_mean:.4f}")
@@ -1649,7 +1461,6 @@ class CSMF(nn.Module):
             "invertibility_err": inv_err_mean,
             "h_norm_mean":       h_norm_mean,
             "nan_rate":          nan_rate,
-            "inv_fatal":         inv_fatal,  # [INV-PERSIST] consumed by train_stage_A
         }
 
     @torch.no_grad()

@@ -1,9 +1,18 @@
 """
 Conditional Affine Coupling Layers for CSMF
 
-Version: WP0.2-Coupling-v1.8.0
-Last Modified: 2026-03-08
+Version: WP0.2-Coupling-v1.9.0
+Last Modified: 2026-04-06
 Changelog:
+  v1.9.0 (2026-04-06): [ACTNORM-CLAMP] Clamp log_scale in ActNorm.forward() to [-3, 3] —
+                        unclamped log_scale caused RealNVP NLL to decrease linearly to -22000
+                        over 50 epochs via log-det exploitation (784 dims × N ActNorm layers
+                        each contributing unbounded log_scale.sum() to log-det); clamped ls
+                        used for both transform and log_det; parameter itself unchanged so
+                        gradient still flows; mirrors Glow-style log_scale constraint
+  v1.8.1 (2026-03-25): [F] Downgraded 3 DIAG diagnostic log calls from WARNING to DEBUG level —
+                        h.norm, s/t range, and x_out checks were flooding the log and burying
+                        real warnings during Stage A training. No logic changes.
   v1.8.0 (2026-03-08): [A] Added ActNorm class — per-element affine transform with data-driven
                         initialization; loc/log_scale initialized from first batch mean/std;
                         forward: y=(x+loc)*exp(log_scale), inverse: x=y*exp(-log_scale)-loc;
@@ -310,7 +319,7 @@ class ConditionalAffineCoupling(nn.Module):
             h = torch.mean(h, dim=[2, 3])  # Global average pooling -> [B, h_dim]
         
         # DIAG-Z: h norm check
-        logger.warning(f"[DIAG] h.norm mean={h.norm(dim=-1).mean():.2f}, max={h.norm(dim=-1).max():.2f}")
+        logger.debug(f"[DIAG] h.norm mean={h.norm(dim=-1).mean():.2f}, max={h.norm(dim=-1).max():.2f}")
             
         if self.debug:
             logger.debug(f"  Conditioning h: shape={h.shape}, norm={h.norm().item():.6f}")
@@ -362,7 +371,7 @@ class ConditionalAffineCoupling(nn.Module):
         t = self.t_max * t / torch.sqrt(1.0 + t ** 2)
         
         # DIAG-Z: s/t range check post-clamp
-        logger.warning(f"[DIAG] s range=[{s.min():.4f},{s.max():.4f}], t range=[{t.min():.4f},{t.max():.4f}]")
+        logger.debug(f"[DIAG] s range=[{s.min():.4f},{s.max():.4f}], t range=[{t.min():.4f},{t.max():.4f}]")
 
                 
         # [v1.3 DEBUG] Log scale/shift output
@@ -420,7 +429,7 @@ class ConditionalAffineCoupling(nn.Module):
                 log_det = log_det - s.sum(dim=1)
                 
         # DIAG-Z: x_out explosion check
-        logger.warning(f"[DIAG] x_out mean={x_out.mean():.4e}, std={x_out.std():.4e}, max_abs={x_out.abs().max():.4e}")
+        logger.debug(f"[DIAG] x_out mean={x_out.mean():.4e}, std={x_out.std():.4e}, max_abs={x_out.abs().max():.4e}")
 
 
         
@@ -674,14 +683,18 @@ class ActNorm(nn.Module):
             self.log_scale.data.zero_()
 
         B = x.shape[0]
+        # [ACTNORM-CLAMP] Clamp log_scale to prevent log-det exploitation —
+        # unclamped log_scale.sum() over 784 dims drives NLL → -∞ linearly.
+        # Parameter itself is unchanged; gradient still flows through clamp.
+        ls = self.log_scale.clamp(-3.0, 3.0)
         # log_det per sample: sum of log_scale (same for all samples)
-        log_det_per_dim = self.log_scale.sum()   # scalar
+        log_det_per_dim = ls.sum()   # scalar
 
         if not reverse:
-            y = (x + self.loc) * torch.exp(self.log_scale)
+            y = (x + self.loc) * torch.exp(ls)
             log_det = log_det_per_dim.expand(B)
         else:
-            y = x * torch.exp(-self.log_scale) - self.loc
+            y = x * torch.exp(-ls) - self.loc
             log_det = (-log_det_per_dim).expand(B)
 
         if torch.isnan(y).any() or torch.isinf(y).any():

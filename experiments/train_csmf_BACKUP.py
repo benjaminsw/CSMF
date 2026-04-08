@@ -1,32 +1,7 @@
 # =============================================================================
-# Version: WP3.2-TrainMain-v2.7 | Abbr: TRAIN-MAIN
+# Version: WP3.2-TrainMain-v2.2 | Abbr: TRAIN-MAIN
 # Description: Main CSMF training script — 3-stage protocol with expert registry
 # Changelog:
-#   v2.7 (2026-04-07): [DIAG-OUTPUT] Experiment-rooted output under logs/<run_name>/;
-#                      --run-name CLI arg added (default "default"); ckpt_dir and
-#                      results_dir now default to run_dir subfolders; SA-DIAG and
-#                      SB-DIAG imported and called after Stage A and B respectively;
-#                      stage_*_diagnostics/ dirs defined centrally; summary_all_stages.json
-#                      built from stage_a/b/c_summary.json after all stages (partial-safe)
-#   v2.6 (2026-04-06): Added weight_decay=1e-4 for ConditionalGlowCSF — sigmoid
-#                      saturation (near_boundary=0.809) caused by large activations
-#                      from unchecked weight growth; weight decay mirrors existing
-#                      MAF/NSF treatment; _GCSF_WEIGHT_DECAY=1e-4 added alongside
-#                      _MAF/_NSF constants; _make_optimizer GlowCSF branch added
-#   v2.5 (2026-04-06): [CKPT-GATE] Gate Stage B checkpoint auto-load on "C" in stages —
-#                      previously unconditional load in Stage B else-branch crashed with
-#                      FileNotFoundError when running --stages A only (no Stage B ckpt
-#                      exists); load now only triggered if Stage C will run; --resume
-#                      path preserved inside the new gate condition
-#   v2.4 (2026-04-05): Removed expert_sanity import and EXP-SANITY call block —
-#                      csmf.evaluation.expert_sanity is deprecated (kept with header);
-#                      --skip-sanity CLI arg removed; fisher_info_diag was never
-#                      imported here (deprecated file only); Stage A logs EXP-SANITY
-#                      deprecated notice in place of former call block
-#   v2.3 (2026-04-05): Added weight_decay=1e-4 for ConditionalNSF alongside
-#                      ConditionalMAF — NSF FiLM weights grow unchecked causing
-#                      NaN at epoch 2 even with clamps; weight decay slows growth;
-#                      _make_optimizer extended with NSF branch
 #   v2.2 (2026-04-02): Added ConditionalGlowCSF (COND-GCSF-v1.0) to expert registry
 #                      under key 'gcsf'; import added alongside existing flow imports;
 #                      no changes to instantiation logic — GlowCSF uses cond_dim alias
@@ -126,10 +101,8 @@ from csmf.flows.conditional_glow_csf import ConditionalGlowCSF
 from csmf.models.csmf import CSMF
 from csmf.physics.forward_models import SRForwardModel
 from csmf.losses.hybrid_loss import HybridLoss
-from csmf.evaluation.stage_a_diagnostics import run as run_stage_a_diagnostics  # v2.7: SA-DIAG
-from csmf.evaluation.stage_b_diagnostics import run as run_stage_b_diagnostics  # v2.7: SB-DIAG
-from csmf.evaluation.stage_c_diagnostics import run_stage_c_diagnostics         # v1.8: SC-DIAG
-# NOTE: expert_sanity and fisher_info_diag are deprecated — not imported (v2.4)
+from csmf.evaluation.expert_sanity import run_expert_sanity  # v1.6: EXP-SANITY
+from csmf.evaluation.stage_c_diagnostics import run_stage_c_diagnostics  # v1.8: SC-DIAG
 
 # ---------------------------------------------------------------------------
 # Expert registry — add/remove entries to test combinations
@@ -200,10 +173,6 @@ def parse_args() -> argparse.Namespace:
                    default=None,
                    help="Expert subset, e.g. --experts realnvp maf")
 
-    # Experiment name — sets logs/<run_name>/ as output root [v2.7]
-    p.add_argument("--run-name", type=str, default="default",
-                   help="Experiment name — outputs go to logs/<run_name>/")
-
     # Paths
     p.add_argument("--ckpt-dir",    type=str, default=None,
                    help="Checkpoint directory (overrides config CKPT_DIR)")
@@ -233,6 +202,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--expert-lr", nargs="+", default=None,
                    metavar="NAME=LR",
                    help="Per-expert LR as name=value pairs, e.g. realnvp=1e-3 maf=5e-4")
+
+    # v1.6: skip expert sanity checks after Stage A
+    p.add_argument("--skip-sanity", action="store_true", default=False,
+                   help="Skip EXP-SANITY diagnostic checks/plots after Stage A")
 
     # v1.8: skip Stage C diagnostics
     p.add_argument("--skip-c-diag", action="store_true", default=False,
@@ -716,25 +689,21 @@ def main() -> None:
     epochs      = args.epochs  or EPOCHS
     batch_size  = args.batch   or BATCH_SIZE
     seed        = args.seed    or SEED
-    experts_cfg = args.experts or ACTIVE_EXPERTS
+    ckpt_dir    = args.ckpt_dir    or CKPT_DIR
+    results_dir = args.results_dir or RESULTS_DIR
+    experts_cfg = args.experts     or ACTIVE_EXPERTS
     stages      = args.stages
     preprocessed_dir = args.preprocessed_dir or PREPROCESSED_DIR  # v1.3
 
-    # [v2.7] experiment root: logs/<run_name>/
-    run_dir     = os.path.join("logs", args.run_name)
-    ckpt_dir    = args.ckpt_dir    or os.path.join(run_dir, "checkpoints")
-    results_dir = args.results_dir or run_dir
-
     # --- Logging ---
-    log_path = os.path.join(run_dir, "train_csmf.log")
+    log_path = os.path.join(results_dir, "train_csmf.log")
     logger   = setup_logging(log_path)
     logger.info("=" * 60)
-    logger.info(f"CSMF Training | TRAIN-MAIN-v2.7 | run_name={args.run_name}")
+    logger.info("CSMF Training | WP3.2-TrainMain-v1.3 | TRAIN-MAIN")
     logger.info("=" * 60)
 
     # --- Config summary ---
     cfg_summary = {
-        "run_name": args.run_name, "run_dir": run_dir,
         "lr": lr, "epochs": epochs, "batch_size": batch_size,
         "seed": seed, "stages": stages, "active_experts": experts_cfg,
         "ckpt_dir": ckpt_dir, "results_dir": results_dir,
@@ -754,13 +723,9 @@ def main() -> None:
         f" | {torch.cuda.get_device_name(0)}" if device.type == "cuda" else " (CPU — no GPU detected)"
     ))
 
-    # --- Dirs --- [v2.7] all output rooted under run_dir
-    os.makedirs(run_dir,     exist_ok=True)
+    # --- Dirs ---
     os.makedirs(ckpt_dir,    exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
-    a_diag_dir = os.path.join(run_dir, "stage_a_diagnostics")
-    b_diag_dir = os.path.join(run_dir, "stage_b_diagnostics")
-    c_diag_dir = os.path.join(run_dir, "stage_c_diagnostics")
 
     # --- Resolve per-stage checkpoint paths ---
     # CLI --ckpt-A/B/C override; otherwise fall back to default paths in ckpt_dir
@@ -843,21 +808,10 @@ def main() -> None:
         try:
             # v1.3: per-expert optimizer_fn callable; supports --expert-lr per expert
             # v2.1: weight_decay=1e-4 applied to MAF only (overfitting mitigation)
-            # v2.3: weight_decay=1e-4 also applied to NSF (FiLM weight explosion)
-            # v2.6: weight_decay=1e-4 also applied to GlowCSF (sigmoid saturation)
-            _MAF_WEIGHT_DECAY  = 1e-4
-            _NSF_WEIGHT_DECAY  = 1e-4
-            _GCSF_WEIGHT_DECAY = 1e-4
+            _MAF_WEIGHT_DECAY = 1e-4
 
             def _make_optimizer(expert, lr_val):
-                if isinstance(expert, ConditionalMAF):
-                    wd = _MAF_WEIGHT_DECAY
-                elif isinstance(expert, ConditionalNSF):
-                    wd = _NSF_WEIGHT_DECAY
-                elif isinstance(expert, ConditionalGlowCSF):
-                    wd = _GCSF_WEIGHT_DECAY
-                else:
-                    wd = 0.0
+                wd = _MAF_WEIGHT_DECAY if isinstance(expert, ConditionalMAF) else 0.0
                 return torch.optim.Adam(expert.parameters(), lr=lr_val, weight_decay=wd)
 
             if args.expert_lr:
@@ -883,18 +837,28 @@ def main() -> None:
             )
             logger.info("Stage A complete.")
 
-            # [v2.7] SA-DIAG — run after Stage A
-            try:
-                run_stage_a_diagnostics(
-                    csmf_model   = model,
-                    val_loader   = val_loader,
-                    epoch_logs   = epoch_logs,
-                    expert_names = [type(e).__name__ for e in model.experts],
-                    output_dir   = a_diag_dir,
-                    device       = device,
-                )
-            except Exception as e:
-                logger.error(f"SA-DIAG failed (non-fatal): {e}")
+            # v1.6: EXP-SANITY — diagnostic checks and plots after Stage A
+            if not args.skip_sanity and val_loader is not None:
+                try:
+                    sanity_dir = os.path.join(results_dir, "expert_sanity")
+                    sanity_summary = run_expert_sanity(
+                        csmf_model     = model,
+                        val_loader     = val_loader,
+                        fwd_model      = hybrid_loss.A,
+                        epoch_logs     = epoch_logs,
+                        output_dir     = sanity_dir,
+                        plots          = ["1", "2", "3", "A", "D", "F"],
+                    )
+                    logger.info(f"EXP-SANITY complete | summary: {sanity_summary}")
+                except ValueError as e:
+                    logger.error(f"EXP-SANITY fatal check failed — aborting: {e}")
+                    raise
+                except Exception as e:
+                    logger.warning(f"EXP-SANITY non-fatal error (continuing): {e}")
+            elif args.skip_sanity:
+                logger.info("EXP-SANITY skipped (--skip-sanity)")
+            else:
+                logger.info("EXP-SANITY skipped (no val_loader)")
 
         except Exception as e:
             logger.error(f"Stage A failed: {e}")
@@ -1034,53 +998,22 @@ def main() -> None:
                 logger.warning(f"[GS] Best combo checkpoint not found: {best_ckpt}")
 
         logger.info("Stage B complete.")
-
-        # [v2.7] SB-DIAG — run after Stage B (non-grid path uses last epoch_logs)
-        if not is_grid:
-            _b_logs = epoch_logs
-        else:
-            # grid: use best combo logs if available
-            _b_logs = grid_results.get(best_combo, {}) if best_combo else {}
-
-        if _b_logs:
-            try:
-                run_stage_b_diagnostics(
-                    epoch_logs   = _b_logs,
-                    expert_names = [type(e).__name__ for e in model.experts],
-                    output_dir   = b_diag_dir,
-                    hyperparams  = {
-                        "lambda_neff":  neff_regs[-1] if neff_regs else 0.0,
-                        "tau_start":    tau_starts[-1] if tau_starts else TAU_START,
-                        "tau_end":      tau_end,
-                        "lambda_cons":  LAMBDA_CONS,
-                        "lambda_trans": LAMBDA_TRANS,
-                        "lambda_cal":   LAMBDA_CAL,
-                    },
-                    model      = model,
-                    val_loader = val_loader,
-                )
-            except Exception as e:
-                logger.error(f"SB-DIAG failed (non-fatal): {e}")
-        else:
-            logger.warning("SB-DIAG skipped — no epoch_logs available")
     else:
-        logger.info("Stage B skipped.")
-        # [CKPT-GATE] Only load Stage B checkpoint if Stage C will run —
-        # avoids FileNotFoundError when running --stages A only.
-        if "C" in args.stages:
-            if not args.resume:
-                logger.info("Loading Stage B checkpoint for downstream Stage C.")
-                load_stage_checkpoint(
-                    model       = model,
-                    ckpt_path   = ckpt_path_B,
-                    stage_label = "B",
-                    experts_cfg = experts_cfg,
-                    logger      = logger,
-                )
-            else:
-                logger.info(
-                    "Stage B auto-load skipped — general --resume checkpoint already loaded."
-                )
+        logger.info("Stage B skipped — loading checkpoint for downstream stages.")
+        # Auto-load Stage B checkpoint so gate weights are properly initialised
+        # before Stage C (joint fine-tuning) can begin.
+        if not args.resume:
+            load_stage_checkpoint(
+                model       = model,
+                ckpt_path   = ckpt_path_B,
+                stage_label = "B",
+                experts_cfg = experts_cfg,
+                logger      = logger,
+            )
+        else:
+            logger.info(
+                "Stage B auto-load skipped — general --resume checkpoint already loaded."
+            )
 
     # =========================================================================
     # Stage C — Joint fine-tuning
@@ -1108,9 +1041,10 @@ def main() -> None:
             )
             logger.info("Stage C complete.")
 
-            # v1.8 / [v2.7]: SC-DIAG — B-vs-C comparison plots and metrics
+            # v1.8: SC-DIAG — B-vs-C comparison plots and metrics
             if not args.skip_c_diag and val_loader is not None:
                 try:
+                    c_diag_dir = os.path.join(results_dir, "stage_c_diagnostics")
                     c_diag_summary = run_stage_c_diagnostics(
                         csmf_model     = model,
                         val_loader     = val_loader,
@@ -1156,33 +1090,6 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Final evaluation failed: {e}")
         raise
-
-    # [v2.7] Build summary_all_stages.json — partial-safe: includes whichever
-    # stage summaries exist on disk. Does not raise if a stage was skipped.
-    _summary_all: dict = {"run_name": args.run_name, "stages_run": stages}
-    for _stage, _diag_dir, _fname in [
-        ("A", a_diag_dir, "stage_a_summary.json"),
-        ("B", b_diag_dir, "stage_b_summary.json"),
-        ("C", c_diag_dir, "stage_c_summary.json"),
-    ]:
-        _json_path = os.path.join(_diag_dir, _fname)
-        if os.path.exists(_json_path):
-            try:
-                with open(_json_path) as _f:
-                    _summary_all[f"stage_{_stage}"] = json.load(_f)
-                logger.info(f"summary_all_stages: loaded {_fname}")
-            except Exception as _e:
-                logger.error(f"summary_all_stages: failed to load {_fname}: {_e}")
-        else:
-            logger.warning(f"summary_all_stages: {_fname} not found — stage {_stage} may not have run")
-
-    _all_path = os.path.join(run_dir, "summary_all_stages.json")
-    try:
-        with open(_all_path, "w") as _f:
-            json.dump(_summary_all, _f, indent=2, default=str)
-        logger.info(f"summary_all_stages.json saved: {_all_path}")
-    except Exception as _e:
-        logger.error(f"Failed to save summary_all_stages.json: {_e}")
 
 
 if __name__ == "__main__":

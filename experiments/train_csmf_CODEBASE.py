@@ -1,60 +1,7 @@
 # =============================================================================
-# Version: WP3.2-TrainMain-v2.7 | Abbr: TRAIN-MAIN
+# Version: WP3.2-TrainMain-v1.6 | Abbr: TRAIN-MAIN
 # Description: Main CSMF training script — 3-stage protocol with expert registry
 # Changelog:
-#   v2.7 (2026-04-07): [DIAG-OUTPUT] Experiment-rooted output under logs/<run_name>/;
-#                      --run-name CLI arg added (default "default"); ckpt_dir and
-#                      results_dir now default to run_dir subfolders; SA-DIAG and
-#                      SB-DIAG imported and called after Stage A and B respectively;
-#                      stage_*_diagnostics/ dirs defined centrally; summary_all_stages.json
-#                      built from stage_a/b/c_summary.json after all stages (partial-safe)
-#   v2.6 (2026-04-06): Added weight_decay=1e-4 for ConditionalGlowCSF — sigmoid
-#                      saturation (near_boundary=0.809) caused by large activations
-#                      from unchecked weight growth; weight decay mirrors existing
-#                      MAF/NSF treatment; _GCSF_WEIGHT_DECAY=1e-4 added alongside
-#                      _MAF/_NSF constants; _make_optimizer GlowCSF branch added
-#   v2.5 (2026-04-06): [CKPT-GATE] Gate Stage B checkpoint auto-load on "C" in stages —
-#                      previously unconditional load in Stage B else-branch crashed with
-#                      FileNotFoundError when running --stages A only (no Stage B ckpt
-#                      exists); load now only triggered if Stage C will run; --resume
-#                      path preserved inside the new gate condition
-#   v2.4 (2026-04-05): Removed expert_sanity import and EXP-SANITY call block —
-#                      csmf.evaluation.expert_sanity is deprecated (kept with header);
-#                      --skip-sanity CLI arg removed; fisher_info_diag was never
-#                      imported here (deprecated file only); Stage A logs EXP-SANITY
-#                      deprecated notice in place of former call block
-#   v2.3 (2026-04-05): Added weight_decay=1e-4 for ConditionalNSF alongside
-#                      ConditionalMAF — NSF FiLM weights grow unchecked causing
-#                      NaN at epoch 2 even with clamps; weight decay slows growth;
-#                      _make_optimizer extended with NSF branch
-#   v2.2 (2026-04-02): Added ConditionalGlowCSF (COND-GCSF-v1.0) to expert registry
-#                      under key 'gcsf'; import added alongside existing flow imports;
-#                      no changes to instantiation logic — GlowCSF uses cond_dim alias
-#                      matching the cls(dim=latent_dim, cond_dim=hidden_dim) path
-#   v2.1 (2026-04-02): Stage A optimizer_fn now applies weight_decay=1e-4 specifically
-#                      for ConditionalMAF — addresses severe train/val NLL gap observed
-#                      in Stage A; all other experts retain weight_decay=0; both
-#                      --expert-lr and default paths updated to apply per-expert decay
-#   v2.0 (2026-04-02): Added ConditionalCSF (COND-CSF-v1.0) to expert registry under
-#                      key 'csf'; import added alongside existing flow imports; no changes
-#                      to instantiation logic — CSF uses cond_dim alias matching the
-#                      cls(dim=latent_dim, cond_dim=hidden_dim) path at line ~361
-#   v1.9 (2026-03-31): Removed hardcoded SEED=42 module-level block — was seeding
-#                      with wrong value before mnist_config import; replaced fix_seed()
-#                      body with set_seed() from MNIST-CFG (single source of truth);
-#                      DataLoader now receives worker_init_fn=make_worker_init_fn(seed)
-#                      and generator=torch.Generator().manual_seed(seed) for full
-#                      worker-level reproducibility; set_seed() imported from mnist_config
-#   v1.8 (2026-03-29): Added --skip-c-diag CLI flag; after Stage C calls
-#                      run_stage_c_diagnostics() from SC-DIAG for B-vs-C comparison
-#                      plots and metrics; epoch_logs captured from train_stage_C()
-#                      return value (v1.3.18); output to results/stage_c_diagnostics/
-#   v1.7 (2026-03-25): [GS] Stage B grid search — added --neff-reg, --tau-start,
-#                      --tau-end CLI args; when multiple values provided for neff-reg
-#                      or tau-start, runs Stage B once per (λ,τ) combo loading Stage A
-#                      checkpoint each time; saves per-combo diagnostics to
-#                      results/stageb_grid/lam{λ}_tau{τ}/; generates comparison plot
-#                      results/stageb_grid/comparison.png (Neff + val loss per combo)
 #   v1.6 (2026-03-01): Added --skip-sanity CLI flag; after Stage A calls
 #                      run_expert_sanity() from EXP-SANITY for diagnostic checks
 #                      and plots (Core 1-3 + A/D/F); epoch_logs captured from
@@ -96,9 +43,6 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-import random
-
-
 from torch.utils.data import DataLoader
 
 # ---------------------------------------------------------------------------
@@ -113,7 +57,7 @@ from configs.mnist_config import (
     ACTIVE_EXPERTS,
     VAL_SPLIT, PATIENCE,
     BLOCKS_TO_UNFREEZE, TAU_START, TAU_END,
-    config_hash, set_seed, make_worker_init_fn,
+    config_hash,
 )
 from scripts.preprocess_mnist import create_precomputed_dataloaders
 from csmf.conditioning.conditioning_networks import MNISTConditioner
@@ -121,15 +65,10 @@ from csmf.flows.conditional_realnvp import ConditionalRealNVP
 from csmf.flows.conditional_maf import ConditionalMAF
 from csmf.flows.conditional_nice import ConditionalNICE
 from csmf.flows.conditional_nsf import ConditionalNSF
-from csmf.flows.conditional_csf import ConditionalCSF
-from csmf.flows.conditional_glow_csf import ConditionalGlowCSF
 from csmf.models.csmf import CSMF
 from csmf.physics.forward_models import SRForwardModel
 from csmf.losses.hybrid_loss import HybridLoss
-from csmf.evaluation.stage_a_diagnostics import run as run_stage_a_diagnostics  # v2.7: SA-DIAG
-from csmf.evaluation.stage_b_diagnostics import run as run_stage_b_diagnostics  # v2.7: SB-DIAG
-from csmf.evaluation.stage_c_diagnostics import run_stage_c_diagnostics         # v1.8: SC-DIAG
-# NOTE: expert_sanity and fisher_info_diag are deprecated — not imported (v2.4)
+from csmf.evaluation.expert_sanity import run_expert_sanity  # v1.6: EXP-SANITY
 
 # ---------------------------------------------------------------------------
 # Expert registry — add/remove entries to test combinations
@@ -139,8 +78,6 @@ EXPERT_REGISTRY = {
     "maf":     ConditionalMAF,
     "nice":    ConditionalNICE,
     "nsf":     ConditionalNSF,
-    "csf":     ConditionalCSF,
-    "gcsf":    ConditionalGlowCSF,
 }
 
 # ---------------------------------------------------------------------------
@@ -167,8 +104,13 @@ def setup_logging(log_path: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 def fix_seed(seed: int) -> None:
-    """Fix all random seeds for reproducibility. Delegates to set_seed() from MNIST-CFG."""
-    set_seed(seed)
+    """Fix all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
 
 # ---------------------------------------------------------------------------
@@ -200,10 +142,6 @@ def parse_args() -> argparse.Namespace:
                    default=None,
                    help="Expert subset, e.g. --experts realnvp maf")
 
-    # Experiment name — sets logs/<run_name>/ as output root [v2.7]
-    p.add_argument("--run-name", type=str, default="default",
-                   help="Experiment name — outputs go to logs/<run_name>/")
-
     # Paths
     p.add_argument("--ckpt-dir",    type=str, default=None,
                    help="Checkpoint directory (overrides config CKPT_DIR)")
@@ -234,24 +172,9 @@ def parse_args() -> argparse.Namespace:
                    metavar="NAME=LR",
                    help="Per-expert LR as name=value pairs, e.g. realnvp=1e-3 maf=5e-4")
 
-    # v1.8: skip Stage C diagnostics
-    p.add_argument("--skip-c-diag", action="store_true", default=False,
-                   help="Skip SC-DIAG diagnostic plots/comparison after Stage C")
-
-    # v1.7: Stage B grid search — Neff regularisation + temperature annealing
-    p.add_argument("--neff-reg", nargs="+", type=float, default=None,
-                   metavar="λ",
-                   help="Neff regularisation weight(s) for Stage B grid search, "
-                        "e.g. --neff-reg 0.0 0.1 0.5 1.0")
-    p.add_argument("--tau-start", nargs="+", type=float, default=None,
-                   metavar="τ",
-                   help="Gate temperature start value(s) for Stage B grid search, "
-                        "e.g. --tau-start 1.0 2.0 4.0")
-    p.add_argument("--tau-end", type=float, default=0.5,
-                   help="Gate temperature end value (single, annealed to from tau-start), "
-                        "default=0.5")
-    p.add_argument("--nice-scale", type=float, default=0.10,
-               help="Affine-lite scaling strength for NICE (default=0.10, higher is more flexible)")
+    # v1.6: skip expert sanity checks after Stage A
+    p.add_argument("--skip-sanity", action="store_true", default=False,
+                   help="Skip EXP-SANITY diagnostic checks/plots after Stage A")
 
     return p.parse_args()
 
@@ -337,9 +260,7 @@ def load_stage_checkpoint(
                 f"saved={meta['config_hash']} | current={current_hash} | "
                 f"Re-run from Stage A with current config."
             )
-            #raise ValueError(f"Config hash mismatch on Stage {stage_label} checkpoint")
-            logger.warning(f"Config hash mismatch on Stage {stage_label} checkpoint — bypassed for this run")
-            
+            raise ValueError(f"Config hash mismatch on Stage {stage_label} checkpoint")
     else:
         logger.warning(
             f"Stage {stage_label} checkpoint has no config_hash — "
@@ -357,7 +278,6 @@ def build_model(
     num_layers: int,
     latent_dim: int,
     logger: logging.Logger,
-    args: argparse.Namespace,
 ) -> CSMF:
     """
     Build CSMF from active expert names.
@@ -393,12 +313,6 @@ def build_model(
                 # ConditionalRealNVP uses h_dim; hardcodes 28x28 MNIST dims internally
                 expert = cls(h_dim=hidden_dim)
                 expert.dim = latent_dim  # required by CSMF for gate/sampling
-            elif name == "nice":
-                expert = cls(
-                    dim=latent_dim,
-                    cond_dim=hidden_dim,
-                    scale_strength=getattr(args, "nice_scale", 0.05)
-                )
             else:
                 # ConditionalMAF, ConditionalNICE, ConditionalNSF use dim + cond_dim
                 expert = cls(dim=latent_dim, cond_dim=hidden_dim)
@@ -578,132 +492,6 @@ def eval_final(
 
 
 # ---------------------------------------------------------------------------
-# [GS] v1.7: Stage B grid search comparison plot
-# ---------------------------------------------------------------------------
-
-def _plot_stageb_grid(
-    grid_results: dict,
-    expert_names: list,
-    results_dir: str,
-    logger: logging.Logger,
-) -> None:
-    """
-    [GS] v1.7: Plot Stage B grid search comparison.
-
-    Args:
-        grid_results: {(lambda_neff, tau_start): epoch_logs_dict}
-        expert_names: list of expert class name strings
-        results_dir:  base results directory
-        logger:       logger instance
-
-    Outputs:
-        results/stageb_grid/comparison.png — 3-panel: Neff curves, val loss curves,
-                                             final Neff bar chart per combo
-    """
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        logger.error("[GS] matplotlib not available — grid comparison plot skipped")
-        return
-
-    if not grid_results:
-        logger.warning("[GS] No grid results to plot")
-        return
-
-    grid_dir = os.path.join(results_dir, "stageb_grid")
-    os.makedirs(grid_dir, exist_ok=True)
-
-    combo_labels = [f"λ={lam} τ={tau}" for (lam, tau) in grid_results.keys()]
-    colors       = plt.cm.tab10.colors
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Stage B Grid Search — Neff Reg × Temperature Annealing", fontsize=13)
-
-    # --- Panel 1: Neff over epochs ---
-    ax = axes[0]
-    for i, ((lam, tau), logs) in enumerate(grid_results.items()):
-        neff = logs.get("neff", [])
-        if neff:
-            ax.plot(range(1, len(neff) + 1), neff,
-                    label=combo_labels[i], color=colors[i % len(colors)], marker="o", markersize=2)
-    ax.axhline(y=1.1, color="red", linestyle="--", linewidth=1.0, label="Collapse (1.1)")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Neff")
-    ax.set_title("Neff Over Epochs")
-    ax.legend(fontsize=7)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel 2: Val loss over epochs ---
-    ax = axes[1]
-    has_val = False
-    for i, ((lam, tau), logs) in enumerate(grid_results.items()):
-        val_loss = logs.get("val_loss", [])
-        if val_loss:
-            has_val = True
-            ax.plot(range(1, len(val_loss) + 1), val_loss,
-                    label=combo_labels[i], color=colors[i % len(colors)], marker="s", markersize=2)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Val Loss")
-    ax.set_title("Val Loss Over Epochs")
-    if has_val:
-        ax.legend(fontsize=7)
-    else:
-        ax.text(0.5, 0.5, "No val_loader", transform=ax.transAxes, ha="center")
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel 3: Final Neff bar chart ---
-    ax = axes[2]
-    final_neffs = []
-    for (lam, tau), logs in grid_results.items():
-        neff = logs.get("neff", [])
-        final_neffs.append(neff[-1] if neff else 0.0)
-    bars = ax.bar(range(len(combo_labels)), final_neffs,
-                  color=[colors[i % len(colors)] for i in range(len(combo_labels))])
-    ax.axhline(y=1.1, color="red", linestyle="--", linewidth=1.0, label="Collapse (1.1)")
-    ax.set_xticks(range(len(combo_labels)))
-    ax.set_xticklabels(combo_labels, rotation=30, ha="right", fontsize=7)
-    ax.set_ylabel("Final Neff")
-    ax.set_title("Final Neff per Combo")
-    ax.legend(fontsize=7)
-    ax.grid(True, alpha=0.3, axis="y")
-    for bar, val in zip(bars, final_neffs):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{val:.2f}", ha="center", va="bottom", fontsize=7)
-
-    plt.tight_layout()
-    save_path = os.path.join(grid_dir, "comparison.png")
-    try:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logger.info(f"[GS] Grid search comparison plot saved: {save_path}")
-    except Exception as e:
-        logger.error(f"[GS] Failed to save grid comparison plot: {e}")
-
-    # Save grid summary JSON
-    try:
-        summary = {}
-        for (lam, tau), logs in grid_results.items():
-            key = f"lam{lam}_tau{tau}"
-            neff_list = logs.get("neff", [])
-            val_list  = logs.get("val_loss", [])
-            summary[key] = {
-                "lambda_neff":    lam,
-                "tau_start":      tau,
-                "final_neff":     round(neff_list[-1], 4) if neff_list else None,
-                "best_val_loss":  round(min(val_list), 4) if val_list else None,
-                "total_epochs":   len(neff_list),
-            }
-        json_path = os.path.join(grid_dir, "grid_summary.json")
-        with open(json_path, "w") as f:
-            json.dump(summary, f, indent=2)
-        logger.info(f"[GS] Grid summary JSON saved: {json_path}")
-    except Exception as e:
-        logger.error(f"[GS] Failed to save grid summary JSON: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -716,25 +504,21 @@ def main() -> None:
     epochs      = args.epochs  or EPOCHS
     batch_size  = args.batch   or BATCH_SIZE
     seed        = args.seed    or SEED
-    experts_cfg = args.experts or ACTIVE_EXPERTS
+    ckpt_dir    = args.ckpt_dir    or CKPT_DIR
+    results_dir = args.results_dir or RESULTS_DIR
+    experts_cfg = args.experts     or ACTIVE_EXPERTS
     stages      = args.stages
     preprocessed_dir = args.preprocessed_dir or PREPROCESSED_DIR  # v1.3
 
-    # [v2.7] experiment root: logs/<run_name>/
-    run_dir     = os.path.join("logs", args.run_name)
-    ckpt_dir    = args.ckpt_dir    or os.path.join(run_dir, "checkpoints")
-    results_dir = args.results_dir or run_dir
-
     # --- Logging ---
-    log_path = os.path.join(run_dir, "train_csmf.log")
+    log_path = os.path.join(results_dir, "train_csmf.log")
     logger   = setup_logging(log_path)
     logger.info("=" * 60)
-    logger.info(f"CSMF Training | TRAIN-MAIN-v2.7 | run_name={args.run_name}")
+    logger.info("CSMF Training | WP3.2-TrainMain-v1.3 | TRAIN-MAIN")
     logger.info("=" * 60)
 
     # --- Config summary ---
     cfg_summary = {
-        "run_name": args.run_name, "run_dir": run_dir,
         "lr": lr, "epochs": epochs, "batch_size": batch_size,
         "seed": seed, "stages": stages, "active_experts": experts_cfg,
         "ckpt_dir": ckpt_dir, "results_dir": results_dir,
@@ -754,13 +538,9 @@ def main() -> None:
         f" | {torch.cuda.get_device_name(0)}" if device.type == "cuda" else " (CPU — no GPU detected)"
     ))
 
-    # --- Dirs --- [v2.7] all output rooted under run_dir
-    os.makedirs(run_dir,     exist_ok=True)
+    # --- Dirs ---
     os.makedirs(ckpt_dir,    exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
-    a_diag_dir = os.path.join(run_dir, "stage_a_diagnostics")
-    b_diag_dir = os.path.join(run_dir, "stage_b_diagnostics")
-    c_diag_dir = os.path.join(run_dir, "stage_c_diagnostics")
 
     # --- Resolve per-stage checkpoint paths ---
     # CLI --ckpt-A/B/C override; otherwise fall back to default paths in ckpt_dir
@@ -781,14 +561,10 @@ def main() -> None:
         'val_split':         VAL_SPLIT,
         'seed':              seed,
     }
-    _g = torch.Generator()
-    _g.manual_seed(seed)
     train_loader, val_loader, test_loader = create_precomputed_dataloaders(
         preprocessed_dir = preprocessed_dir,
         batch_size       = batch_size,
         config_params    = config_params,   # validates metadata.json on load
-        worker_init_fn   = make_worker_init_fn(seed),
-        generator        = _g,
     )
 
     # --- Model ---
@@ -798,7 +574,6 @@ def main() -> None:
         num_layers     = NUM_LAYERS,
         latent_dim     = LATENT_DIM,
         logger         = logger,
-        args           = args,  # for any expert-specific args needed during instantiation
     )
     model = model.to(device)
     logger.info(f"Model moved to {device}")
@@ -842,34 +617,18 @@ def main() -> None:
         logger.info("=" * 40)
         try:
             # v1.3: per-expert optimizer_fn callable; supports --expert-lr per expert
-            # v2.1: weight_decay=1e-4 applied to MAF only (overfitting mitigation)
-            # v2.3: weight_decay=1e-4 also applied to NSF (FiLM weight explosion)
-            # v2.6: weight_decay=1e-4 also applied to GlowCSF (sigmoid saturation)
-            _MAF_WEIGHT_DECAY  = 1e-4
-            _NSF_WEIGHT_DECAY  = 1e-4
-            _GCSF_WEIGHT_DECAY = 1e-4
-
-            def _make_optimizer(expert, lr_val):
-                if isinstance(expert, ConditionalMAF):
-                    wd = _MAF_WEIGHT_DECAY
-                elif isinstance(expert, ConditionalNSF):
-                    wd = _NSF_WEIGHT_DECAY
-                elif isinstance(expert, ConditionalGlowCSF):
-                    wd = _GCSF_WEIGHT_DECAY
-                else:
-                    wd = 0.0
-                return torch.optim.Adam(expert.parameters(), lr=lr_val, weight_decay=wd)
-
             if args.expert_lr:
                 expert_lr_map = dict(pair.split('=') for pair in args.expert_lr)
-                optimizer_fn = lambda expert: _make_optimizer(
-                    expert,
-                    float(expert_lr_map.get(
+                optimizer_fn = lambda expert: torch.optim.Adam(
+                    expert.parameters(),
+                    lr=float(expert_lr_map.get(
                         type(expert).__name__.replace('Conditional', '').lower(), lr
                     ))
                 )
             else:
-                optimizer_fn = lambda expert: _make_optimizer(expert, lr)
+                optimizer_fn = lambda expert: torch.optim.Adam(
+                    expert.parameters(), lr=lr
+                )
             epoch_logs = model.train_stage_A(
                 dataloader   = train_loader,
                 optimizer_fn = optimizer_fn,
@@ -883,18 +642,28 @@ def main() -> None:
             )
             logger.info("Stage A complete.")
 
-            # [v2.7] SA-DIAG — run after Stage A
-            try:
-                run_stage_a_diagnostics(
-                    csmf_model   = model,
-                    val_loader   = val_loader,
-                    epoch_logs   = epoch_logs,
-                    expert_names = [type(e).__name__ for e in model.experts],
-                    output_dir   = a_diag_dir,
-                    device       = device,
-                )
-            except Exception as e:
-                logger.error(f"SA-DIAG failed (non-fatal): {e}")
+            # v1.6: EXP-SANITY — diagnostic checks and plots after Stage A
+            if not args.skip_sanity and val_loader is not None:
+                try:
+                    sanity_dir = os.path.join(results_dir, "expert_sanity")
+                    sanity_summary = run_expert_sanity(
+                        csmf_model     = model,
+                        val_loader     = val_loader,
+                        fwd_model      = hybrid_loss.A,
+                        epoch_logs     = epoch_logs,
+                        output_dir     = sanity_dir,
+                        plots          = ["1", "2", "3", "A", "D", "F"],
+                    )
+                    logger.info(f"EXP-SANITY complete | summary: {sanity_summary}")
+                except ValueError as e:
+                    logger.error(f"EXP-SANITY fatal check failed — aborting: {e}")
+                    raise
+                except Exception as e:
+                    logger.warning(f"EXP-SANITY non-fatal error (continuing): {e}")
+            elif args.skip_sanity:
+                logger.info("EXP-SANITY skipped (--skip-sanity)")
+            else:
+                logger.info("EXP-SANITY skipped (no val_loader)")
 
         except Exception as e:
             logger.error(f"Stage A failed: {e}")
@@ -925,162 +694,46 @@ def main() -> None:
                 )
 
     # =========================================================================
-    # Stage B — Gate training (with optional grid search)
+    # Stage B — Gate training
     # =========================================================================
     if "B" in stages:
         logger.info("=" * 40)
         logger.info("Stage B: Gate Training")
         logger.info("=" * 40)
-
-        # [GS] v1.7: build grid from CLI args; default = single run with no reg
-        neff_regs  = args.neff_reg  if (args.neff_reg  and len(args.neff_reg)  > 0) else [0.0]
-        tau_starts = args.tau_start if (args.tau_start and len(args.tau_start) > 0) else [TAU_START]
-        tau_end    = args.tau_end   if args.tau_end is not None else TAU_END
-        is_grid    = (len(neff_regs) > 1 or len(tau_starts) > 1)
-
-        grid = [(lam, tau) for lam in neff_regs for tau in tau_starts]
-        logger.info(
-            f"[GS] Stage B grid: {len(grid)} combo(s) | "
-            f"neff_reg={neff_regs} | tau_start={tau_starts} | tau_end={tau_end}"
-        )
-
-        grid_results: dict = {}   # {(lam, tau): epoch_logs}
-        best_combo         = None
-        best_combo_neff    = -1.0
-
-        for lam, tau in grid:
-            combo_tag     = f"lam{lam}_tau{tau}"
-            combo_dir     = os.path.join(results_dir, "stageb_grid", combo_tag) if is_grid else results_dir
-            combo_ckpt    = os.path.join(ckpt_dir, f"csmf_stage_B_{combo_tag}.pth") if is_grid else ckpt_path_B
-            os.makedirs(combo_dir, exist_ok=True)
-
-            logger.info(f"[GS] Running combo: λ={lam}, τ_start={tau}, τ_end={tau_end}")
-
-            # [GS] reload Stage A checkpoint for each combo to reset gate weights
-            if is_grid:
-                try:
-                    load_stage_checkpoint(
-                        model=model, ckpt_path=ckpt_path_A,
-                        stage_label="A", experts_cfg=experts_cfg, logger=logger,
-                    )
-                    logger.info(f"[GS] Stage A checkpoint reloaded for combo {combo_tag}")
-                    # Freeze experts after reload — load_stage_checkpoint restores
-                    # weights but does not set requires_grad=False
-                    for expert in model.experts:
-                        for p in expert.parameters():
-                            p.requires_grad = False
-                    logger.info("[GS] Experts re-frozen after Stage A reload")
-                except Exception as e:
-                    logger.error(f"[GS] Failed to reload Stage A for combo {combo_tag}: {e}")
-                    raise
-
-            try:
-                optimizer_B = torch.optim.Adam(
-                    model.gate.parameters(),
-                    lr=lr / 10,
-                )
-                epoch_logs = model.train_stage_B(
-                    dataloader  = train_loader,
-                    optimizer   = optimizer_B,
-                    hybrid_loss = hybrid_loss,
-                    epochs      = epochs_per_stage,
-                    val_loader  = val_loader,
-                    patience    = PATIENCE,
-                    ckpt_path   = combo_ckpt,
-                    results_dir = combo_dir,
-                    lambda_neff = lam,
-                    tau_start   = tau,
-                    tau_end     = tau_end,
-                )
-                grid_results[(lam, tau)] = epoch_logs
-
-                # Track best combo by final Neff
-                final_neff = epoch_logs["neff"][-1] if epoch_logs["neff"] else 0.0
-                if final_neff > best_combo_neff:
-                    best_combo_neff = final_neff
-                    best_combo      = (lam, tau)
-
-                logger.info(
-                    f"[GS] Combo {combo_tag} done | final_neff={final_neff:.3f}"
-                )
-            except Exception as e:
-                logger.error(f"[GS] Stage B combo {combo_tag} failed: {e}")
-                raise
-
-        # [GS] generate comparison plot if grid search
-        if is_grid:
-            expert_names_list = [type(e).__name__ for e in model.experts]
-            _plot_stageb_grid(
-                grid_results=grid_results,
-                expert_names=expert_names_list,
-                results_dir=results_dir,
-                logger=logger,
+        try:
+            optimizer_B = torch.optim.Adam(
+                model.gate.parameters(),
+                lr=lr / 10,
             )
-            logger.info(
-                f"[GS] Best combo: λ={best_combo[0]}, τ={best_combo[1]} "
-                f"| final_neff={best_combo_neff:.3f}"
+            model.train_stage_B(
+                dataloader  = train_loader,
+                optimizer   = optimizer_B,
+                hybrid_loss = hybrid_loss,
+                epochs      = epochs_per_stage,
+                val_loader  = val_loader,
+                patience    = PATIENCE,
+                ckpt_path   = ckpt_path_B,
             )
-            # Load best combo checkpoint for downstream Stage C
-            best_ckpt = os.path.join(
-                ckpt_dir, f"csmf_stage_B_lam{best_combo[0]}_tau{best_combo[1]}.pth"
-            )
-            if os.path.exists(best_ckpt):
-                load_stage_checkpoint(
-                    model=model, ckpt_path=best_ckpt,
-                    stage_label="B", experts_cfg=experts_cfg, logger=logger,
-                )
-                logger.info(f"[GS] Best combo checkpoint loaded for Stage C: {best_ckpt}")
-            else:
-                logger.warning(f"[GS] Best combo checkpoint not found: {best_ckpt}")
-
-        logger.info("Stage B complete.")
-
-        # [v2.7] SB-DIAG — run after Stage B (non-grid path uses last epoch_logs)
-        if not is_grid:
-            _b_logs = epoch_logs
-        else:
-            # grid: use best combo logs if available
-            _b_logs = grid_results.get(best_combo, {}) if best_combo else {}
-
-        if _b_logs:
-            try:
-                run_stage_b_diagnostics(
-                    epoch_logs   = _b_logs,
-                    expert_names = [type(e).__name__ for e in model.experts],
-                    output_dir   = b_diag_dir,
-                    hyperparams  = {
-                        "lambda_neff":  neff_regs[-1] if neff_regs else 0.0,
-                        "tau_start":    tau_starts[-1] if tau_starts else TAU_START,
-                        "tau_end":      tau_end,
-                        "lambda_cons":  LAMBDA_CONS,
-                        "lambda_trans": LAMBDA_TRANS,
-                        "lambda_cal":   LAMBDA_CAL,
-                    },
-                    model      = model,
-                    val_loader = val_loader,
-                )
-            except Exception as e:
-                logger.error(f"SB-DIAG failed (non-fatal): {e}")
-        else:
-            logger.warning("SB-DIAG skipped — no epoch_logs available")
+            logger.info("Stage B complete.")
+        except Exception as e:
+            logger.error(f"Stage B failed: {e}")
+            raise
     else:
-        logger.info("Stage B skipped.")
-        # [CKPT-GATE] Only load Stage B checkpoint if Stage C will run —
-        # avoids FileNotFoundError when running --stages A only.
-        if "C" in args.stages:
-            if not args.resume:
-                logger.info("Loading Stage B checkpoint for downstream Stage C.")
-                load_stage_checkpoint(
-                    model       = model,
-                    ckpt_path   = ckpt_path_B,
-                    stage_label = "B",
-                    experts_cfg = experts_cfg,
-                    logger      = logger,
-                )
-            else:
-                logger.info(
-                    "Stage B auto-load skipped — general --resume checkpoint already loaded."
-                )
+        logger.info("Stage B skipped — loading checkpoint for downstream stages.")
+        # Auto-load Stage B checkpoint so gate weights are properly initialised
+        # before Stage C (joint fine-tuning) can begin.
+        if not args.resume:
+            load_stage_checkpoint(
+                model       = model,
+                ckpt_path   = ckpt_path_B,
+                stage_label = "B",
+                experts_cfg = experts_cfg,
+                logger      = logger,
+            )
+        else:
+            logger.info(
+                "Stage B auto-load skipped — general --resume checkpoint already loaded."
+            )
 
     # =========================================================================
     # Stage C — Joint fine-tuning
@@ -1094,7 +747,7 @@ def main() -> None:
                 [p for p in model.parameters() if p.requires_grad],
                 lr=lr / 100,
             )
-            stage_c_logs = model.train_stage_C(
+            model.train_stage_C(
                 dataloader         = train_loader,
                 optimizer          = optimizer_C,
                 hybrid_loss        = hybrid_loss,
@@ -1107,27 +760,6 @@ def main() -> None:
                 ckpt_path          = ckpt_path_C,
             )
             logger.info("Stage C complete.")
-
-            # v1.8 / [v2.7]: SC-DIAG — B-vs-C comparison plots and metrics
-            if not args.skip_c_diag and val_loader is not None:
-                try:
-                    c_diag_summary = run_stage_c_diagnostics(
-                        csmf_model     = model,
-                        val_loader     = val_loader,
-                        fwd_model      = hybrid_loss.A,
-                        epoch_logs     = stage_c_logs,
-                        ckpt_path_B    = ckpt_path_B,
-                        expert_names   = experts_cfg,
-                        output_dir     = c_diag_dir,
-                    )
-                    logger.info(f"SC-DIAG complete | summary: {c_diag_summary}")
-                except Exception as e:
-                    logger.warning(f"SC-DIAG non-fatal error (continuing): {e}")
-            elif args.skip_c_diag:
-                logger.info("SC-DIAG skipped (--skip-c-diag)")
-            else:
-                logger.info("SC-DIAG skipped (no val_loader)")
-
         except Exception as e:
             logger.error(f"Stage C failed: {e}")
             raise
@@ -1156,33 +788,6 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Final evaluation failed: {e}")
         raise
-
-    # [v2.7] Build summary_all_stages.json — partial-safe: includes whichever
-    # stage summaries exist on disk. Does not raise if a stage was skipped.
-    _summary_all: dict = {"run_name": args.run_name, "stages_run": stages}
-    for _stage, _diag_dir, _fname in [
-        ("A", a_diag_dir, "stage_a_summary.json"),
-        ("B", b_diag_dir, "stage_b_summary.json"),
-        ("C", c_diag_dir, "stage_c_summary.json"),
-    ]:
-        _json_path = os.path.join(_diag_dir, _fname)
-        if os.path.exists(_json_path):
-            try:
-                with open(_json_path) as _f:
-                    _summary_all[f"stage_{_stage}"] = json.load(_f)
-                logger.info(f"summary_all_stages: loaded {_fname}")
-            except Exception as _e:
-                logger.error(f"summary_all_stages: failed to load {_fname}: {_e}")
-        else:
-            logger.warning(f"summary_all_stages: {_fname} not found — stage {_stage} may not have run")
-
-    _all_path = os.path.join(run_dir, "summary_all_stages.json")
-    try:
-        with open(_all_path, "w") as _f:
-            json.dump(_summary_all, _f, indent=2, default=str)
-        logger.info(f"summary_all_stages.json saved: {_all_path}")
-    except Exception as _e:
-        logger.error(f"Failed to save summary_all_stages.json: {_e}")
 
 
 if __name__ == "__main__":

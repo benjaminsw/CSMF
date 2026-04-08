@@ -1,5 +1,5 @@
 # =============================================================================
-# Version: WP3.3-ExpertSanity-v1.0 | Abbr: EXP-SANITY
+# Version: WP3.3-ExpertSanity-v1.1 | Abbr: EXP-SANITY
 # Description: Expert sanity checks and diagnostic visualizations.
 #              Called between Stage A → Stage B to verify experts are
 #              reasonable before gate training.
@@ -8,6 +8,13 @@
 #                      (Core 1-3: NLL/epochs, inv_err/epochs, z-hist;
 #                       Additional A: recon grid, D: pairwise NLL, F: NLL rank)
 #                      Returns summary dict, saves JSON + PNGs to output_dir
+#   v1.1 (2026-04-03): Fix 1: Plot A switched from z~N(0,1) decode to encode→decode
+#                      (z=f(x,h) then f⁻¹(z,h)) — separates invertibility bugs from
+#                      generation quality. Fix 2: Added identity conditioning test
+#                      (_check_identity_conditioning) — feeds clean x as y to verify
+#                      conditioning path. Fix 3: Added λ_cons residual ablation
+#                      (_check_lambda_cons_residual) — logs ‖Ax̂−y‖² baseline at
+#                      current λ and recommended 0.5 to catch instability pre-retrain.
 # Dependencies: CSMF-MAIN v1.3.6+, matplotlib, torch
 # =============================================================================
 
@@ -61,7 +68,7 @@ def run_expert_sanity(
         ValueError: if sample quality check fails (fatal).
     """
     if plots is None:
-        plots = ["1", "2", "3", "A", "D", "F"]
+        plots = ["1", "2", "3", "A", "D", "F", "I", "L"]
 
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"[EXP-SANITY] Starting expert sanity | output_dir={output_dir} | plots={plots}")
@@ -270,6 +277,33 @@ def run_expert_sanity(
         except Exception as e:
             logger.error(f"[EXP-SANITY] Plot F failed: {e}")
 
+    # Fix 2 — Identity conditioning test (feed clean x as y)
+    if "I" in plots:
+        try:
+            identity_results = _check_identity_conditioning(
+                csmf_model, val_loader, device, expert_names
+            )
+            summary["identity_conditioning"] = identity_results
+            logger.info("[EXP-SANITY] Identity conditioning check complete")
+        except Exception as e:
+            logger.error(f"[EXP-SANITY] Identity conditioning check failed: {e}")
+            summary["identity_conditioning"] = {"error": str(e)}
+
+    # Fix 3 — λ_cons residual ablation (baseline vs recommended 0.5)
+    if "L" in plots and fwd_model is not None:
+        try:
+            ablation_results = _check_lambda_cons_residual(
+                csmf_model, val_loader, fwd_model, device, expert_names,
+                per_expert_data, lambda_cons_recommended=0.5,
+            )
+            summary["lambda_cons_ablation"] = ablation_results
+            logger.info("[EXP-SANITY] λ_cons residual ablation complete")
+        except Exception as e:
+            logger.error(f"[EXP-SANITY] λ_cons ablation failed: {e}")
+            summary["lambda_cons_ablation"] = {"error": str(e)}
+    elif "L" in plots and fwd_model is None:
+        logger.warning("[EXP-SANITY] Plot L skipped — fwd_model is None")
+
     # ------------------------------------------------------------------
     # Save summary JSON
     # ------------------------------------------------------------------
@@ -383,8 +417,9 @@ def _plot_reconstruction_grid(
     max_samples: int = 8,
 ) -> None:
     """
-    Additional Plot A: For the same y inputs, show x̂ = f⁻¹(z, h) per expert.
-    Grid: rows = samples, cols = [y | expert_0 | expert_1 | ...]
+    Additional Plot A: Encode→decode reconstruction per expert.
+    z = f(x, h), x̂ = f⁻¹(z, h) — separates invertibility bugs from generation quality.
+    Grid: rows = samples, cols = [y | x_clean | expert_0 x̂ | expert_1 x̂ | ...]
     """
     K = len(expert_names)
     # Grab first batch
@@ -395,7 +430,7 @@ def _plot_reconstruction_grid(
     h = csmf_model.conditioner(y_deg)
 
     fig, axes = plt.subplots(n, K + 2, figsize=(2.5 * (K + 2), 2.5 * n), squeeze=False)
-    col_labels = ["y (input)", "x (clean)"] + expert_names
+    col_labels = ["y (input)", "x (clean)"] + [f"{name}\nz=f(x,h)→f⁻¹" for name in expert_names]
 
     for i in range(n):
         # Col 0: degraded y
@@ -408,25 +443,27 @@ def _plot_reconstruction_grid(
         axes[i, 1].imshow(x_img, cmap="gray", vmin=0, vmax=1)
         axes[i, 1].axis("off")
 
-        # Cols 2+: per-expert reconstruction from z ~ N(0,1)
+        # Cols 2+: per-expert encode→decode reconstruction
         for k, expert in enumerate(csmf_model.experts):
             try:
-                z_base = csmf_model.base_dist.sample(
-                    (1, csmf_model.dim)
-                ).to(device)
+                # Encode: z = f(x, h)
+                z, log_det, log_prob, z_flist = csmf_model._expert_forward(
+                    expert, x_clean[i:i+1], y_deg[i:i+1], h[i:i+1]
+                )
+                # Decode: x̂ = f⁻¹(z, h)
                 x_hat = csmf_model._expert_inverse(
-                    expert, z_base, y_deg[i:i+1], h[i:i+1], z_factored_list=None
+                    expert, z, y_deg[i:i+1], h[i:i+1], z_factored_list=z_flist
                 )
                 x_hat_img = x_hat.cpu().view(28, 28)
                 axes[i, k + 2].imshow(x_hat_img.clamp(0, 1), cmap="gray", vmin=0, vmax=1)
             except Exception as e:
-                logger.error(f"[EXP-SANITY] Plot A | sample {i} expert {k}: {e}")
+                logger.error(f"[EXP-SANITY] Plot A | sample {i} expert {k} encode→decode: {e}")
                 axes[i, k + 2].text(0.5, 0.5, "ERR", ha="center", va="center", fontsize=10)
             axes[i, k + 2].axis("off")
 
     for c, lbl in enumerate(col_labels):
         axes[0, c].set_title(lbl, fontsize=9)
-    fig.suptitle("Stage A — Per-Expert Reconstructions (z ~ N(0,1))", fontsize=13)
+    fig.suptitle("Stage A — Per-Expert Reconstructions (encode→decode: z=f(x,h), x̂=f⁻¹(z,h))", fontsize=11)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "reconstruction_grid.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -524,3 +561,230 @@ def _plot_nll_rank_histogram(
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "nll_rank_histogram.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+# =============================================================================
+# Fix 2 — Identity conditioning check
+# =============================================================================
+
+@torch.no_grad()
+def _check_identity_conditioning(
+    csmf_model,
+    val_loader,
+    device: torch.device,
+    expert_names: List[str],
+    identity_err_warn_threshold: float = 0.1,
+    n_batches: int = 3,
+) -> Dict[str, Any]:
+    """
+    Fix 2: Feed clean x as y (identity conditioning test).
+
+    Computes h = conditioner(x_clean), then encodes and decodes x_clean
+    through each expert. Measures ‖x̂ − x‖ — should be near zero if the
+    conditioning path and invertibility are both healthy.
+
+    Args:
+        csmf_model:                 CSMF model with frozen experts.
+        val_loader:                 Validation DataLoader yielding (x_clean, y_deg).
+        device:                     Compute device.
+        expert_names:               List of expert class names.
+        identity_err_warn_threshold: Log warning if mean abs err exceeds this.
+        n_batches:                  Number of val batches to average over.
+
+    Returns:
+        Dict with per-expert identity errors and pass/warn status.
+    """
+    results: Dict[str, Any] = {}
+    K = len(csmf_model.experts)
+
+    per_expert_errs: Dict[int, list] = {k: [] for k in range(K)}
+
+    collected = 0
+    for x_clean, y_deg in val_loader:
+        if collected >= n_batches:
+            break
+        x_clean = x_clean.to(device)
+        # Feed x_clean as the conditioning input (identity test)
+        try:
+            h_id = csmf_model.conditioner(x_clean)
+        except Exception as e:
+            logger.error(f"[EXP-SANITY] Identity test | conditioner(x_clean) failed batch={collected}: {e}")
+            collected += 1
+            continue
+
+        for k, expert in enumerate(csmf_model.experts):
+            try:
+                # Encode x through expert conditioned on x (not degraded y)
+                z, log_det, log_prob, z_flist = csmf_model._expert_forward(
+                    expert, x_clean, x_clean, h_id
+                )
+                # Decode back
+                x_hat = csmf_model._expert_inverse(
+                    expert, z, x_clean, h_id, z_factored_list=z_flist
+                )
+                err = (x_hat - x_clean).abs().mean().item()
+                per_expert_errs[k].append(err)
+            except Exception as e:
+                logger.error(
+                    f"[EXP-SANITY] Identity test | expert={k} ({expert_names[k]}) "
+                    f"batch={collected}: {e}"
+                )
+        collected += 1
+
+    if collected == 0:
+        logger.error("[EXP-SANITY] Identity test: no batches collected")
+        return {"error": "no batches collected"}
+
+    for k in range(K):
+        name = expert_names[k]
+        errs = per_expert_errs[k]
+        if not errs:
+            logger.error(f"[EXP-SANITY] Identity test | expert={k} ({name}) | no error data")
+            results[name] = {"mean_abs_err": "no_data", "status": "error"}
+            continue
+        mean_err = float(np.mean(errs))
+        status = "pass" if mean_err <= identity_err_warn_threshold else "warn"
+        if status == "warn":
+            logger.warning(
+                f"[EXP-SANITY] Identity test WARN | expert={k} ({name}) | "
+                f"mean |x̂−x|={mean_err:.6f} > threshold={identity_err_warn_threshold} "
+                f"— conditioning path may be impaired"
+            )
+        else:
+            logger.info(
+                f"[EXP-SANITY] Identity test PASS | expert={k} ({name}) | "
+                f"mean |x̂−x|={mean_err:.6f}"
+            )
+        results[name] = {"mean_abs_err": round(mean_err, 6), "status": status}
+
+    return results
+
+
+# =============================================================================
+# Fix 3 — λ_cons residual ablation
+# =============================================================================
+
+@torch.no_grad()
+def _check_lambda_cons_residual(
+    csmf_model,
+    val_loader,
+    fwd_model,
+    device: torch.device,
+    expert_names: List[str],
+    per_expert_data: Dict[int, dict],
+    lambda_cons_recommended: float = 0.5,
+    n_batches: int = 5,
+) -> Dict[str, Any]:
+    """
+    Fix 3: λ_cons residual ablation — logs consistency residual ‖Ax̂−y‖²
+    per expert as a baseline before committing to λ_cons=0.5.
+
+    Computes mean residual using generated samples (z~N(0,1) decode) over
+    val batches. Also computes NLL/residual ratio to expose whether NLL is
+    currently dominating (ratio >> 1 → λ_cons too small).
+
+    Args:
+        csmf_model:              CSMF model with frozen experts.
+        val_loader:              Validation DataLoader yielding (x_clean, y_deg).
+        fwd_model:               Forward model A (must implement __call__(x) → Ax).
+        device:                  Compute device.
+        expert_names:            List of expert class names.
+        per_expert_data:         Collected val-pass data (for mean NLL lookup).
+        lambda_cons_recommended: Target λ_cons to flag in recommendation.
+        n_batches:               Batches to average residual over.
+
+    Returns:
+        Dict with per-expert residuals, NLL/residual ratios, and recommendation.
+    """
+    results: Dict[str, Any] = {"per_expert": {}, "recommendation": {}}
+    K = len(csmf_model.experts)
+
+    per_expert_residuals: Dict[int, list] = {k: [] for k in range(K)}
+
+    collected = 0
+    for x_clean, y_deg in val_loader:
+        if collected >= n_batches:
+            break
+        x_clean = x_clean.to(device)
+        y_deg = y_deg.to(device)
+        h = csmf_model.conditioner(y_deg)
+
+        for k, expert in enumerate(csmf_model.experts):
+            try:
+                z_base = csmf_model.base_dist.sample(
+                    (y_deg.shape[0], csmf_model.dim)
+                ).to(device)
+                x_hat = csmf_model._expert_inverse(
+                    expert, z_base, y_deg, h, z_factored_list=None
+                )
+                if torch.isnan(x_hat).any():
+                    logger.warning(
+                        f"[EXP-SANITY] λ_cons ablation | expert={k} ({expert_names[k]}) "
+                        f"| NaN in x_hat at batch={collected} — skipping batch"
+                    )
+                    continue
+                # Compute forward model output and residual
+                Ax_hat = fwd_model(x_hat)
+                residual = ((Ax_hat - y_deg) ** 2).mean().item()
+                per_expert_residuals[k].append(residual)
+            except Exception as e:
+                logger.error(
+                    f"[EXP-SANITY] λ_cons ablation | expert={k} ({expert_names[k]}) "
+                    f"batch={collected}: {e}"
+                )
+        collected += 1
+
+    if collected == 0:
+        logger.error("[EXP-SANITY] λ_cons ablation: no batches collected")
+        return {"error": "no batches collected"}
+
+    for k in range(K):
+        name = expert_names[k]
+        resid_list = per_expert_residuals[k]
+        if not resid_list:
+            logger.error(f"[EXP-SANITY] λ_cons ablation | expert={k} ({name}) | no residual data")
+            results["per_expert"][name] = {"mean_residual": "no_data"}
+            continue
+
+        mean_residual = float(np.mean(resid_list))
+
+        # NLL/residual ratio — large ratio means NLL dominates
+        nll_data = per_expert_data[k]["nll_per_sample"]
+        mean_nll = nll_data.mean().item() if nll_data.numel() > 0 else float("nan")
+        ratio = mean_nll / (mean_residual + 1e-8)
+
+        status = "nll_dominates" if ratio > 10.0 else "balanced"
+        logger.info(
+            f"[EXP-SANITY] λ_cons ablation | expert={k} ({name}) | "
+            f"mean_residual={mean_residual:.6f} | mean_NLL={mean_nll:.4f} | "
+            f"NLL/residual ratio={ratio:.2f} | status={status}"
+        )
+        results["per_expert"][name] = {
+            "mean_residual": round(mean_residual, 6),
+            "mean_nll": round(mean_nll, 4) if not np.isnan(mean_nll) else "no_data",
+            "nll_residual_ratio": round(ratio, 2),
+            "status": status,
+        }
+
+    # Overall recommendation
+    any_dominated = any(
+        v.get("status") == "nll_dominates"
+        for v in results["per_expert"].values()
+        if isinstance(v, dict)
+    )
+    results["recommendation"] = {
+        "lambda_cons_recommended": lambda_cons_recommended,
+        "increase_lambda_cons": any_dominated,
+        "note": (
+            f"NLL/residual ratio > 10 for at least one expert — "
+            f"recommend increasing λ_cons to {lambda_cons_recommended}."
+        ) if any_dominated else (
+            f"λ_cons appears balanced — verify residual trend at epoch 1 after "
+            f"increasing to {lambda_cons_recommended} before committing."
+        ),
+    }
+    logger.info(
+        f"[EXP-SANITY] λ_cons ablation recommendation: "
+        f"increase={any_dominated}, note={results['recommendation']['note']}"
+    )
+    return results

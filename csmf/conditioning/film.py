@@ -2,9 +2,21 @@
 FiLM (Feature-wise Linear Modulation)
 Applies γ(h) ⊙ f + β(h) transformation with identity initialization
 
-Version: WP0.1-FiLM-v1.1.1
-Last Modified: 2026-03-09
+Version: WP0.1-FiLM-v1.1.3
+Last Modified: 2026-04-05
 Changelog:
+  v1.1.3 (2026-04-05): [F] Clamp h to (-10, 10) before gamma_mlp/beta_mlp calls —
+                        h_norm=85.6 observed during NSF Stage A epoch 6; large h causes
+                        NaN inside MLP linear layers before any output clamp can act;
+                        clamping h at entry point stops explosion at source; bound (-10,10)
+                        chosen to be wide enough for stable flows, tight enough for NSF
+  v1.1.2 (2026-04-05): [F] Hard clamps on gamma/beta post-computation and out post-FiLM —
+                        softclamps (v1.1.0/v1.1.1) bound gamma to (-4,6) and beta to (-5,5)
+                        but compound stacking across NSF layers could still overflow; hard
+                        clamp gamma/beta to (-5,5) closes the upper gamma gap (6→5); hard
+                        clamp out to (-50,50) catches any residual compound explosion before
+                        it propagates to spline/coupling layers; no impact on stable flows
+                        (RealNVP/MAF/NICE/CSF/GlowCSF) where values stay well within bounds
   v1.1.1 (2026-03-09): [F] Softclamp on beta_delta — unconstrained beta_mlp output caused
                         feature explosion via additive path (beta=5.0×100=500 added to every
                         hidden unit); same softclamp formula as gamma_delta, bounds beta to
@@ -114,6 +126,11 @@ class FiLM(nn.Module):
             if self.debug:
                 logger.debug(f"  h spatial pooling: {h_original_shape} -> {h.shape}")
         
+        # [F] v1.1.3 — Clamp h before MLP calls to prevent NaN inside linear layers.
+        # h_norm=85.6 observed at NSF epoch 6; clamping at source stops explosion
+        # before it enters gamma_mlp/beta_mlp where no output clamp can intercept.
+        h = h.clamp(-10.0, 10.0)
+
         # Compute modulation deltas
         gamma_delta = self.gamma_mlp(h)  # [B, f_dim]
         beta_delta = self.beta_mlp(h)    # [B, f_dim]
@@ -147,6 +164,12 @@ class FiLM(nn.Module):
         # Apply identity initialization: gamma starts at 1, beta at 0
         gamma = 1.0 + self.scale_factor * gamma_delta  # [B, f_dim]
         beta = self.scale_factor * beta_delta          # [B, f_dim]
+
+        # [F] v1.1.2 — Hard clamps as safety net on top of softclamps (v1.1.0/v1.1.1).
+        # Softclamps already bound gamma to (-4,6) and beta to (-5,5); hard clamps
+        # tighten gamma upper bound to 5 and guarantee beta stays within (-5,5).
+        gamma = gamma.clamp(-5.0, 5.0)
+        beta  = beta.clamp(-5.0, 5.0)
         
         # ========== DEBUG CHECK 4: WEAK CONDITIONING SIGNAL ==========
         if self.debug:
@@ -216,6 +239,10 @@ class FiLM(nn.Module):
             logger.debug(f"  Step 2: (gamma * f) + beta")
         
         result = gamma_times_f + beta
+
+        # [F] v1.1.2 — Hard clamp on output to catch any residual compound explosion
+        # across stacked FiLM layers before values reach spline/coupling layers.
+        result = result.clamp(-50.0, 50.0)
         
         if self.debug:
             logger.debug(f"    Result: shape={result.shape}, norm={result.norm().item():.6f}")

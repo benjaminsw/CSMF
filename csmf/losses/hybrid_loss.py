@@ -86,8 +86,10 @@ class HybridLoss(nn.Module):
         lambda_trans: float = 0.05,
         lambda_cal: float = 0.01,
         anneal_schedule: Optional[dict] = None,
-        n_sw2_samples: int = 10,
-        sw2_projections: int = 256,
+        n_sw2_samples: int = 4,
+        sw2_projections: int = 32,
+
+        
     ):
         super().__init__()
         self.A = forward_model
@@ -97,6 +99,10 @@ class HybridLoss(nn.Module):
         self.anneal_schedule = anneal_schedule or {}
         self.n_sw2_samples = n_sw2_samples
         self.sw2_projections = sw2_projections
+        self.sw2_every = 10            # compute SW2 every N batches
+        self._batch_counter = 0        # internal counter
+
+
 
     # ------------------------------------------------------------------
     def forward(
@@ -172,7 +178,9 @@ class HybridLoss(nn.Module):
             raise RuntimeError("NaN in consistency loss")
 
         # ---- 3. Transport: SW2(samples, x_clean) -------------------------
-        if lam_trans > 0:
+        #if lam_trans > 0:
+        self._batch_counter += 1
+        if lam_trans > 0 and (self._batch_counter % self.sw2_every == 0):
             x_multi, _ = flow.sample(y_degraded, num_samples=self.n_sw2_samples)  # (B, S, d)
             x_flat    = x_multi.reshape(-1, d)                           # (B*S, d)
             ref_flat  = x_clean.flatten(1).repeat(self.n_sw2_samples, 1)  # (B*S, d)
