@@ -1,9 +1,27 @@
 """
 MNIST Configuration for WP0-WP3
 
-Version: WP0.1-Config-v2.0
-Last Modified: 2026-04-02
+Version: WP0.1-Config-v2.4
+Last Modified: 2026-04-12
 Changelog:
+  v2.4 (2026-04-12): Set ACTIVE_EXPERTS to ['realnvp','nice','nsf','csf'] — 4-expert
+                     config matching logdet_diag_run2 checkpoint; maf and gcsf removed
+                     to align config_hash() with saved Stage A checkpoint and allow
+                     Stage B/C to load without hash mismatch and expert count mismatch
+                     (Try B): LAMBDA_GAP 0.05→0.02 (gentler penalty to avoid
+                     destabilising weaker experts early); MARGIN 1.0→0.5 (z-score
+                     units — penalise gaps > 0.5 std, tighter than margin=1.0);
+                     penalises winner-too-far-ahead while keeping z-normalisation intact
+  v2.2 (2026-04-09): [PATCH-SA-ZN] Replace raw NLL competition with z-score normalised
+                     score: ALPHA_Z=0.3 (z_cons weight), TAU_A updated to 1.0 (z-score
+                     gaps are O(1-3) so raw-NLL tau of 2000 no longer applies); MARGIN
+                     updated to 1.0 (z-score units); ALPHA_Z added to config_hash();
+                     EPS_FLOOR removed from competition (softmax guarantees nonzero weights)
+  v2.1 (2026-04-09): [PATCH-SA-SCW] Add Stage A soft competition hyperparameters —
+                     TAU_A=2000.0 (competition temperature, scaled to MNIST NLL gaps ~4000);
+                     LAMBDA_GAP=0.05 (gap penalty weight, 0 for first 3 epochs warmup);
+                     MARGIN=200.0 (gap penalty margin); EPS_FLOOR=0.05 (weight floor);
+                     TAU_A added to config_hash() for cross-stage drift detection
   v2.0 (2026-04-02): Added 'gcsf' to ACTIVE_EXPERTS — ConditionalGlowCSF (COND-GCSF-v1.0)
                      enabled (6-expert config); added 'gcsf': LR entry to EXPERT_LR;
                      train_csmf.py registry updated separately; config_hash() will
@@ -133,19 +151,28 @@ BLUR_SIGMA        = MNIST_CONFIG['forward_model']['blur_sigma']          # 1.0 �
 NOISE_SIGMA       = MNIST_CONFIG['forward_model']['noise_std']           # 0.1
 
 # Hybrid loss weights
-LAMBDA_CONS  = 0.5 #0.05
-LAMBDA_TRANS = 0.01   # v1.5: disabled for Stage B speed — re-enable for Stage C
-LAMBDA_CAL   = 0.0
+LAMBDA_CONS  = 0.05
+LAMBDA_TRANS = 0.001   # v1.5: disabled for Stage B speed — re-enable for Stage C
+LAMBDA_CAL   = 0.001
 
 # Active experts for CSMF (subset of registry keys)
-ACTIVE_EXPERTS = ['realnvp', 'nice', 'nsf', 'maf', 'csf', 'gcsf']  # v2.0: gcsf added (6-expert config)
+ACTIVE_EXPERTS = ['realnvp', 'nice', 'nsf', 'csf']  # v2.4: 4-expert config matching logdet_diag_run2 checkpoint
 
 # Training protocol
 VAL_SPLIT          = 0.1    # fraction of train set used for validation
 PATIENCE           = 10 #5      # early stopping patience (epochs)
-BLOCKS_TO_UNFREEZE = 1      # Stage C: last N blocks unfrozen per expert
+BLOCKS_TO_UNFREEZE = 0 #1      # Stage C: last N blocks unfrozen per expert
 TAU_START          = 1.1    # Stage C gate temperature start
 TAU_END            = 1.0    # Stage C gate temperature end
+
+# [PATCH-SA-SCW] v2.1 / [PATCH-SA-ZN] v2.2: Stage A soft competition hyperparameters
+# v2.2: competition now uses z-score normalised score (z_nll + ALPHA_Z * z_cons).
+# Z-score gaps are O(1-3), so TAU_A=1.0 and MARGIN=1.0 (z-score units).
+TAU_A       = 1.0    # [v2.2] competition tau — z-score scale (was 2000.0 for raw NLL)
+LAMBDA_GAP  = 0.02   # [v2.3] gap penalty weight — reduced from 0.05 (Try B)
+MARGIN      = 0.5    # [v2.3] gap penalty margin — z-score units, reduced from 1.0 (Try B)
+EPS_FLOOR   = 0.05   # retained for backward compat; not used in z-score competition
+ALPHA_Z     = 0.3    # [v2.2] weight of z_cons in competition score: z_nll + ALPHA_Z*z_cons
 
 # v1.3: Per-expert learning rates for Stage A (defaults to LR if key missing)
 EXPERT_LR = {
@@ -175,6 +202,8 @@ def config_hash() -> str:
         'LAMBDA_CONS':  LAMBDA_CONS,
         'LAMBDA_TRANS': LAMBDA_TRANS,
         'LAMBDA_CAL':   LAMBDA_CAL,
+        'TAU_A':        TAU_A,      # [PATCH-SA-SCW] v2.1
+        'ALPHA_Z':      ALPHA_Z,    # [PATCH-SA-ZN] v2.2
     }
     try:
         return hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()

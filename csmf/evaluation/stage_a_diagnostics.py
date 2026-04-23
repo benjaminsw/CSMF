@@ -1,5 +1,5 @@
 # =============================================================================
-# Version: DIAG-REORG-StageADiag-v1.1 | Abbr: SA-DIAG
+# Version: DIAG-REORG-StageADiag-v1.8 | Abbr: SA-DIAG
 # Description: Stage A diagnostic runner — expert quality after per-expert
 #              pretraining, before gate training. Merges EXP-SANITY v1.1 and
 #              FI-DIAG v1.5. Delegates metric collection to MU v1.0 and
@@ -8,6 +8,47 @@
 #              failed plot is logged and skipped. Fatal conditions are limited
 #              to: epoch_logs required keys missing AND all MU collectors fail.
 # Changelog:
+#   v1.8 (2026-04-18): [P4-4COL] Replace _plot_p4_recon_grid with per-expert
+#                      4-row panel: Original/Degraded/Cycle/Generated. One PNG
+#                      per expert (P4_recon_panel_<Name>.png). Imports
+#                      plot_recon_panel_4col from PU v1.4. Falls back to legacy
+#                      plot_reconstruction_grid if x_gen key absent from batch.
+#   v1.7 (2026-04-17): [P9-3ROW] Update _plot_p9_recon_snapshots title to
+#                      reflect 3-row layout (True / Enc→Dec / Cond. Prior).
+#                      no structural change — PU v1.2 handles layout internally
+#                      based on keys present in snapshot dict (CSMF-MAIN v2.6+)
+#   v1.6 (2026-04-17): [PROX-T] Remove P8 (fi_vs_nll scatter — FI artifact,
+#                      confirmed dead signal) and P11 (gap_hist — Stage A
+#                      soft-competition diagnostic, not affected by PROX-T);
+#                      add P_PROX1 (residual convergence per step), P_PROX2
+#                      (residuals_by_T bar + NLL annotation), P_PROX3 (sample
+#                      std pre/post); run() gains fwd_model_adj, T_values, lam
+#                      args; collect_prox_diagnostics (MU v1.3) wired in Step 2;
+#                      _build_summary gains prox_diagnostics key; all non-fatal;
+#                      skipped gracefully when fwd_model or fwd_model_adj is None
+#   v1.5 (2026-04-11): [LOGDET-DIAG] Add P12–P15 log-det diagnostic plots;
+#                      call collect_logdet_decomposition() (MU v1.2) in run();
+#                      P12=mean(log_det)/mean(log_p_z) bar, P13=log_det hist,
+#                      P14=log_det vs log_p_z scatter, P15=temporal mean+std
+#                      log_det over epochs from epoch_logs; _build_summary gains
+#                      log_det_mean, log_det_per_dim, log_p_z_mean per expert;
+#                      all new plots non-fatal; P15 skipped if key absent
+#   v1.4 (2026-04-09): [PATCH-SA-SCW] Add gap_penalty to _build_summary()
+#                      epoch_logs serialisation — List[float] per expert per
+#                      epoch from CSMF-MAIN v1.5; consumed from LS v1.3
+#                      _STAGE_A_OPTIONAL; diag_version bumped to SA-DIAG-v1.4
+#   v1.3 (2026-04-09): [PATCH-SA-SCW] Add P10 soft-weight-over-epochs line plot
+#                      and P11 NLL-gap histogram; P10 reads soft_weights from
+#                      epoch_logs[name]["soft_weights"] (CSMF-MAIN v1.4+); P11
+#                      computes gap [N,K] from nll_metrics per_expert_nll_samples
+#                      at diagnostic time — no new logging required; both wired
+#                      into run() and _build_summary(); skipped gracefully if
+#                      soft_weights absent or nll_metrics None
+#   v1.2 (2026-04-09): [RECON-SNAP] Add P9 per-expert reconstruction snapshots —
+#                      iterates expert_names, reads epoch_logs[name]["recon_snapshots"],
+#                      calls plot_reconstruction_snapshots once per expert; output
+#                      P9_recon_snapshots_{name}.png; skipped gracefully if key absent
+#                      or list empty. Requires CSMF-MAIN v1.3.30+.
 #   v1.1 (2026-04-07): [DIAG-OUTPUT] Wired into TRAIN-MAIN v2.7 — SA-DIAG now
 #                      called from train_csmf.py after Stage A; output directed
 #                      to run_dir/stage_a_diagnostics/; P7 (FI over epochs) and
@@ -47,14 +88,21 @@ from .metric_utils import (
     collect_invertibility,
     collect_reconstruction_batch,
     compute_fi_option_a_batch,
+    collect_logdet_decomposition,   # [LOGDET-DIAG] v1.5
+    collect_prox_diagnostics,       # [PROX-T] v1.6
 )
 from .plot_utils import (
     plot_epoch_lines,
     plot_pairwise_scatter,
     plot_reconstruction_grid,
+    plot_reconstruction_snapshots,
+    plot_recon_panel_4col,
     plot_expert_bars,
     plot_scatter,
     save_figure,
+    plot_prox_residual_convergence,  # [PROX-T] v1.6
+    plot_prox_nll_scatter,           # [PROX-T] v1.6
+    plot_prox_sample_spread,         # [PROX-T] v1.6
 )
 
 logger = logging.getLogger(__name__)
@@ -80,6 +128,9 @@ def run(
     output_dir: str,
     expert_names: Optional[List[str]] = None,
     fwd_model=None,
+    fwd_model_adj=None,
+    T_values: Optional[List[int]] = None,
+    lam: float = 0.1,
     n_fi_batches: int = 5,
     max_val_batches: int = 20,
 ) -> Dict[str, Any]:
@@ -87,7 +138,7 @@ def run(
     Run Stage A diagnostics after per-expert pretraining.
 
     Replaces calling run_expert_sanity() + run_fi_diagnostics() separately.
-    Generates 8 plots and saves stage_a_summary.json.
+    Generates plots and saves stage_a_summary.json.
 
     Args:
         csmf_model      : CSMF model with trained (frozen) experts.
@@ -97,8 +148,12 @@ def run(
                           {expert_name: {train_nll, val_nll, inv_err, fi_a}}.
         output_dir      : Directory for plots + JSON (created if absent).
         expert_names    : Optional explicit list. If None, derived from model.
-        fwd_model       : Forward model A — only needed if fwd_model residual
-                          checks are required (currently unused in SA-DIAG v1.0).
+        fwd_model       : Forward model A with .forward(x). Required for prox
+                          diagnostics (P_PROX1–3). If None, prox plots skipped.
+        fwd_model_adj   : Adjoint operator At with .adjoint(r) or callable.
+                          Required for prox diagnostics. If None, prox plots skipped.
+        T_values        : Proximal step counts to evaluate. Default [0,1,2,3].
+        lam             : Proximal gradient step size (default 0.1).
         n_fi_batches    : Val batches for final FI Option A aggregation (default 5).
         max_val_batches : Val batches for MU collectors (default 20).
 
@@ -144,6 +199,34 @@ def run(
     recon_batch   = collect_reconstruction_batch(
         csmf_model, val_loader, device, n_samples=8
     )
+    logdet_metrics = collect_logdet_decomposition(   # [LOGDET-DIAG] v1.5
+        csmf_model, val_loader, device, max_batches=max_val_batches
+    )
+
+    # [PROX-T] v1.6 — collect proximal correction diagnostics
+    _can_run_prox = (fwd_model is not None) and (fwd_model_adj is not None)
+    if _can_run_prox:
+        _A_fn  = fwd_model.forward if hasattr(fwd_model, "forward") else fwd_model
+        _At_fn = (fwd_model_adj.adjoint
+                  if hasattr(fwd_model_adj, "adjoint") else fwd_model_adj)
+        prox_diagnostics = collect_prox_diagnostics(
+            csmf_model, val_loader, _A_fn, _At_fn, device,
+            T_values=T_values if T_values is not None else [0, 1, 2, 3],
+            lam=lam, max_batches=max_val_batches,
+        )
+        if prox_diagnostics is None:
+            logger.error(
+                "SA-DIAG | collect_prox_diagnostics returned None — "
+                "P_PROX1, P_PROX2, P_PROX3 will be skipped."
+            )
+    else:
+        prox_diagnostics = None
+        logger.warning(
+            "SA-DIAG | fwd_model or fwd_model_adj is None — "
+            "P_PROX1, P_PROX2, P_PROX3 skipped. "
+            "Pass fwd_model=BlurDownsampleOperator(...) and "
+            "fwd_model_adj=op (same instance) to enable prox diagnostics."
+        )
 
     if nll_metrics is None:
         logger.error(
@@ -162,6 +245,11 @@ def run(
     if recon_batch is None:
         logger.error(
             "SA-DIAG | collect_reconstruction_batch returned None — P4 will be skipped."
+        )
+    if logdet_metrics is None:                          # [LOGDET-DIAG] v1.5
+        logger.error(
+            "SA-DIAG | collect_logdet_decomposition returned None — "
+            "P12, P13, P14 will be skipped."
         )
 
     # ------------------------------------------------------------------
@@ -199,8 +287,38 @@ def run(
     # P7: FI over epochs
     _plot_p7_fi_epochs(epoch_logs, expert_names, logs_ok, output_dir)
 
-    # P8: FI vs NLL scatter (one point per expert, annotated)
-    _plot_p8_fi_vs_nll(fi_summary, nll_metrics, expert_names, output_dir)
+    # P8: REMOVED [PROX-T] v1.6 — FI vs NLL scatter retired (FI ratios are
+    #     logit-preprocessing artifacts; no actionable signal post-PROX-T)
+
+    # P9: Per-expert reconstruction snapshots over epochs
+    _plot_p9_recon_snapshots(epoch_logs, expert_names, logs_ok, output_dir)
+
+    # P10: Soft competition weights over epochs [PATCH-SA-SCW]
+    _plot_p10_soft_weights_epoch(epoch_logs, expert_names, logs_ok, output_dir)
+
+    # P11: REMOVED [PROX-T] v1.6 — NLL gap histogram retired (Stage A
+    #      soft-competition diagnostic only; not affected by PROX-T sampling)
+
+    # P12: mean(log_det) vs mean(log_p_z) bar chart per expert [LOGDET-DIAG]
+    _plot_p12_logdet_bar(logdet_metrics, expert_names, output_dir)
+
+    # P13: Histogram of log_det per expert [LOGDET-DIAG]
+    _plot_p13_logdet_hist(logdet_metrics, expert_names, output_dir)
+
+    # P14: Scatter log_det vs log_p_z per expert [LOGDET-DIAG]
+    _plot_p14_logdet_scatter(logdet_metrics, expert_names, output_dir)
+
+    # P15: Temporal mean + std(log_det) over epochs [LOGDET-DIAG]
+    _plot_p15_logdet_temporal(epoch_logs, expert_names, logs_ok, output_dir)
+
+    # P_PROX1: Residual convergence per step — ||Ax^(t)-y||² vs t [PROX-T]
+    _plot_pprox1_residual_convergence(prox_diagnostics, output_dir)
+
+    # P_PROX2: Residuals by T bar chart with NLL baseline annotation [PROX-T]
+    _plot_pprox2_nll_scatter(prox_diagnostics, output_dir)
+
+    # P_PROX3: Sample std before vs after proximal correction [PROX-T]
+    _plot_pprox3_sample_spread(prox_diagnostics, output_dir)
 
     # ------------------------------------------------------------------
     # Step 5: Build and save stage_a_summary.json
@@ -212,6 +330,8 @@ def run(
         latent_stats   = latent_stats,
         inv_metrics    = inv_metrics,
         fi_summary     = fi_summary,
+        logdet_metrics = logdet_metrics,     # [LOGDET-DIAG] v1.5
+        prox_diagnostics = prox_diagnostics, # [PROX-T] v1.6
     )
 
     json_path = os.path.join(output_dir, "stage_a_summary.json")
@@ -488,28 +608,54 @@ def _plot_p3_latent_z(
 def _plot_p4_recon_grid(
     recon_batch: Optional[Dict], expert_names: List[str], output_dir: str
 ) -> None:
-    """P4: Per-expert encode→decode reconstruction grid."""
+    """P4: Per-expert 4-row reconstruction panel (Original/Degraded/Cycle/Generated).
+
+    [P4-4COL] Generates one PNG per expert:
+        P4_recon_panel_<ExpertName>.png
+    Falls back to legacy plot_reconstruction_grid if x_gen is absent.
+    """
     if recon_batch is None:
         logger.warning("SA-DIAG | P4 skipped — recon_batch collection failed")
         return
-    try:
-        # Build x_hat dict with expert_names as keys
-        raw_xhat = recon_batch.get("x_hat", {})
-        xhat_named = {
-            expert_names[k]: v
-            for k, v in raw_xhat.items()
-            if k < len(expert_names) and v is not None
-        }
 
-        plot_reconstruction_grid(
-            y           = recon_batch.get("y"),
-            output_path = os.path.join(output_dir, "P4_recon_grid.png"),
-            title       = "Stage A — Per-Expert Reconstruction (encode→decode: z=f(x,h), x̂=f⁻¹(z,h))",
-            x_clean     = recon_batch.get("x_clean"),
-            x_hat       = xhat_named,
-        )
-    except Exception as e:
-        logger.error(f"SA-DIAG | P4 failed: {e}")
+    y       = recon_batch.get("y")
+    x_clean = recon_batch.get("x_clean")
+    x_hat   = recon_batch.get("x_hat", {})
+    x_gen   = recon_batch.get("x_gen", {})
+
+    has_gen = bool(x_gen)
+
+    for k, name in enumerate(expert_names):
+        x_cycle = x_hat.get(k)
+        x_gen_k = x_gen.get(k) if has_gen else None
+        safe_name = name.replace("/", "_").replace(" ", "_")
+
+        if has_gen:
+            # [P4-4COL] Full 4-row panel
+            plot_recon_panel_4col(
+                x_clean     = x_clean,
+                y           = y,
+                x_cycle     = x_cycle,
+                x_gen       = x_gen_k,
+                expert_name = name,
+                output_path = os.path.join(output_dir, f"P4_recon_panel_{safe_name}.png"),
+                n_samples   = 8,
+            )
+        else:
+            # Fallback: legacy 3-column grid (no Generated row)
+            logger.warning(
+                f"SA-DIAG | P4 | expert={name}: x_gen absent — using legacy grid"
+            )
+            try:
+                plot_reconstruction_grid(
+                    y           = y,
+                    output_path = os.path.join(output_dir, f"P4_recon_grid_{safe_name}.png"),
+                    title       = f"Stage A — {name} (encode→decode only)",
+                    x_clean     = x_clean,
+                    x_hat       = {name: x_cycle} if x_cycle is not None else {},
+                )
+            except Exception as e:
+                logger.error(f"SA-DIAG | P4 legacy fallback failed for {name}: {e}")
 
 
 def _plot_p5_pairwise_nll(
@@ -626,53 +772,52 @@ def _plot_p7_fi_epochs(
         logger.error(f"SA-DIAG | P7 failed: {e}")
 
 
-def _plot_p8_fi_vs_nll(
-    fi_summary: Dict, nll_metrics: Optional[Dict],
-    expert_names: List[str], output_dir: str
+# _plot_p8_fi_vs_nll — RETIRED [PROX-T] v1.6
+# FI ratio flags were confirmed to be artifacts of logit preprocessing, not
+# true expert collapse. Scatter of FI vs NLL added noise without actionable
+# signal post-PROX-T. Removed to reduce diagnostic clutter.
+
+
+
+
+def _plot_p9_recon_snapshots(
+    epoch_logs: Dict, expert_names: List[str], logs_ok: bool, output_dir: str
 ) -> None:
-    """P8: FI vs NLL scatter — one annotated point per expert."""
-    if not fi_summary:
-        logger.warning("SA-DIAG | P8 skipped — fi_summary empty")
+    """P9: Per-expert reconstruction snapshots over Stage A epochs.
+    3-row layout per snapshot (CSMF-MAIN v2.6+, PU v1.2+):
+      Row 0 — Ground Truth | Row 1 — Encode→Decode | Row 2 — Cond. Prior
+    Falls back to legacy 2-row layout for older checkpoints.
+    """
+    if not logs_ok:
+        logger.warning("SA-DIAG | P9 skipped — epoch_logs not available")
         return
-    if nll_metrics is None:
-        logger.warning("SA-DIAG | P8 skipped — nll_metrics collection failed")
-        return
-    try:
-        per_expert_fi  = fi_summary.get("per_expert", {})
-        per_expert_nll = nll_metrics.get("per_expert_nll_mean", {})
-
-        x_vals, y_vals, labels = [], [], []
-        for name in expert_names:
-            nll_val = per_expert_nll.get(name, float("nan"))
-            fi_val  = (per_expert_fi.get(name) or {}).get("F_k_mean") or float("nan")
-            x_vals.append(float(nll_val))
-            y_vals.append(float(fi_val))
-            labels.append(name)
-
-        plot_scatter(
-            x            = np.array(x_vals),
-            y            = np.array(y_vals),
-            output_path  = os.path.join(output_dir, "P8_fi_vs_nll.png"),
-            title        = "Stage A — FI vs NLL Per Expert",
-            xlabel       = "NLL_k (mean over val batches)",
-            ylabel       = "FI_k Option A (mean grad norm² / B)",
-            point_labels = labels,
-        )
-    except Exception as e:
-        logger.error(f"SA-DIAG | P8 failed: {e}")
-
-
-# =============================================================================
-# JSON summary builder
-# =============================================================================
+    for name in expert_names:
+        try:
+            snapshots = epoch_logs.get(name, {}).get("recon_snapshots", [])
+            if not snapshots:
+                logger.warning(f"SA-DIAG | P9: no snapshots for expert '{name}' — skipping")
+                continue
+            safe_name = name.replace(" ", "_")
+            plot_reconstruction_snapshots(
+                snapshots   = snapshots,
+                output_path = os.path.join(output_dir, f"P9_recon_snapshots_{safe_name}.png"),
+                title       = (
+                    f"Stage A — {name} Reconstruction Over Epochs\n"
+                    "Row 0: Ground Truth | Row 1: Encode→Decode | Row 2: Cond. Prior"
+                ),
+            )
+        except Exception as e:
+            logger.error(f"SA-DIAG | P9 failed for expert '{name}': {e}")
 
 def _build_summary(
-    expert_names: List[str],
-    epoch_logs:   Dict,
-    nll_metrics:  Optional[Dict],
-    latent_stats: Optional[Dict],
-    inv_metrics:  Optional[Dict],
-    fi_summary:   Dict,
+    expert_names:    List[str],
+    epoch_logs:      Dict,
+    nll_metrics:     Optional[Dict],
+    latent_stats:    Optional[Dict],
+    inv_metrics:     Optional[Dict],
+    fi_summary:      Dict,
+    logdet_metrics:  Optional[Dict] = None,     # [LOGDET-DIAG] v1.5
+    prox_diagnostics: Optional[Dict] = None,    # [PROX-T] v1.6
 ) -> Dict[str, Any]:
     """
     Build the full stage_a_summary.json payload.
@@ -690,10 +835,14 @@ def _build_summary(
     for name in expert_names:
         logs = epoch_logs.get(name, {})
         epoch_logs_serial[name] = {
-            "train_nll": _safe_list(logs.get("train_nll", [])),
-            "val_nll":   _safe_list(logs.get("val_nll", [])),
-            "inv_err":   _safe_list(logs.get("inv_err", [])),
-            "fi_a":      _safe_list(logs.get("fi_a", [])),
+            "train_nll":     _safe_list(logs.get("train_nll", [])),
+            "val_nll":       _safe_list(logs.get("val_nll", [])),
+            "inv_err":       _safe_list(logs.get("inv_err", [])),
+            "fi_a":          _safe_list(logs.get("fi_a", [])),
+            "soft_weights":  _safe_list(logs.get("soft_weights", [])),  # [PATCH-SA-SCW]
+            "gap_penalty":   _safe_list(logs.get("gap_penalty", [])),   # [PATCH-SA-SCW v1.5]
+            "log_det_mean":  _safe_list(logs.get("log_det_mean", [])),  # [LOGDET-DIAG] v1.5
+            "log_det_std":   _safe_list(logs.get("log_det_std",  [])),  # [LOGDET-DIAG] v1.5
         }
 
     # Val-set metrics
@@ -757,11 +906,29 @@ def _build_summary(
     else:
         val_metrics["invertibility"] = None
 
+    # [LOGDET-DIAG] v1.5 — per-expert log_det / log_p_z summary from val set
+    if logdet_metrics is not None:
+        logdet_summary: Dict[str, Any] = {}
+        for name, ld_data in logdet_metrics.items():
+            ld  = ld_data["log_det"]
+            lp  = ld_data["log_p_z"]
+            D   = ld_data["D"]
+            ld_mean = float(ld.mean().item())
+            lp_mean = float(lp.mean().item())
+            logdet_summary[name] = {
+                "log_det_mean":    round(ld_mean, 6) if np.isfinite(ld_mean) else None,
+                "log_det_per_dim": round(ld_mean / D, 6) if D > 0 and np.isfinite(ld_mean) else None,
+                "log_p_z_mean":    round(lp_mean, 6) if np.isfinite(lp_mean) else None,
+            }
+        val_metrics["logdet_decomposition"] = logdet_summary
+    else:
+        val_metrics["logdet_decomposition"] = None
+
     return {
         "metadata": {
             "timestamp":    datetime.datetime.now().isoformat(timespec="seconds"),
             "expert_names": expert_names,
-            "diag_version": "SA-DIAG-v1.0",
+            "diag_version": "SA-DIAG-v1.6",   # [PROX-T] bumped from v1.5
         },
         "epoch_logs":  epoch_logs_serial,
         "val_metrics": val_metrics,
@@ -770,4 +937,351 @@ def _build_summary(
             "n_batches":  fi_summary.get("n_batches", 0),
             "verdict":    fi_summary.get("verdict", {}),
         },
+        "prox_diagnostics": prox_diagnostics,   # [PROX-T] v1.6 — None if skipped
     }
+
+
+# =============================================================================
+# P10: Soft competition weights over epochs [PATCH-SA-SCW]
+# =============================================================================
+
+def _plot_p10_soft_weights_epoch(
+    epoch_logs:   Dict[str, Any],
+    expert_names: List[str],
+    logs_ok:      bool,
+    output_dir:   str,
+) -> bool:
+    """
+    P10: Line plot of mean soft competition weight w_k per expert over training epochs.
+
+    One line per expert. If all lines stay flat and equal (~1/K), tau_A may need
+    tuning or NLL gaps are too large for the current scale. If one expert dominates
+    from the start, competition is not working.
+
+    Reads: epoch_logs[name]["soft_weights"] — List[float], one value per epoch.
+    Requires CSMF-MAIN v1.4+ (PATCH-SA-SCW).
+    Skipped gracefully if key absent for all experts.
+    """
+    try:
+        if not logs_ok:
+            logger.warning("SA-DIAG | P10: epoch_logs invalid — skipping soft weights plot")
+            return False
+
+        # Check at least one expert has soft_weights
+        has_weights = any(
+            "soft_weights" in epoch_logs.get(name, {}) and
+            len(epoch_logs[name]["soft_weights"]) > 0
+            for name in expert_names
+        )
+        if not has_weights:
+            logger.warning(
+                "SA-DIAG | P10: soft_weights absent in all experts — "
+                "requires CSMF-MAIN v1.4+; skipping"
+            )
+            return False
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        plotted = False
+
+        for name in expert_names:
+            sw = epoch_logs.get(name, {}).get("soft_weights", [])
+            if not sw:
+                logger.warning(f"SA-DIAG | P10: soft_weights empty for '{name}' — skipping")
+                continue
+            ax.plot(range(1, len(sw) + 1), sw, label=name, linewidth=1.5)
+            plotted = True
+
+        if not plotted:
+            logger.error("SA-DIAG | P10: no valid soft_weights series to plot")
+            plt.close(fig)
+            return False
+
+        K = len(expert_names)
+        ax.axhline(1.0 / K, color="gray", linestyle="--", linewidth=0.8,
+                   label=f"Uniform (1/{K}={1/K:.3f})")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Mean competition weight $w_k$")
+        ax.set_title("Stage A — Soft Competition Weights per Expert [PATCH-SA-SCW]")
+        ax.legend(fontsize=8)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, alpha=0.3)
+
+        out_path = os.path.join(output_dir, "P10_soft_weights_epoch.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"SA-DIAG | P10 saved: {out_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"SA-DIAG | P10 failed: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return False
+
+
+# _plot_p11_gap_hist — RETIRED [PROX-T] v1.6
+# NLL gap histogram was a Stage A soft-competition diagnostic only.
+# Not affected by PROX-T sampling; removed to reduce diagnostic clutter.
+
+
+# =============================================================================
+# P12–P15: Log-det decomposition diagnostics [LOGDET-DIAG] v1.5
+# =============================================================================
+
+def _plot_p12_logdet_bar(
+    logdet_metrics: Optional[Dict],
+    expert_names:   List[str],
+    output_dir:     str,
+) -> None:
+    """P12: Grouped bar — mean(log_det) vs mean(log_p_z) per expert.
+    Pinpoints which component drives RealNVP's NLL advantage."""
+    if logdet_metrics is None:
+        logger.warning("SA-DIAG | P12 skipped — logdet_metrics unavailable")
+        return
+    try:
+        names   = [n for n in expert_names if n in logdet_metrics]
+        if not names:
+            logger.warning("SA-DIAG | P12 skipped — no experts in logdet_metrics")
+            return
+        ld_means = [logdet_metrics[n]["log_det"].mean().item() for n in names]
+        lp_means = [logdet_metrics[n]["log_p_z"].mean().item() for n in names]
+
+        x   = np.arange(len(names))
+        w   = 0.35
+        fig, ax = plt.subplots(figsize=(max(6, len(names) * 1.5), 5))
+        ax.bar(x - w / 2, ld_means, w, label="mean(log_det)", color="steelblue")
+        ax.bar(x + w / 2, lp_means, w, label="mean(log_p(z))", color="coral")
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=15, ha="right")
+        ax.set_ylabel("Value")
+        ax.set_title("Stage A — NLL Decomposition: log_det vs log_p(z) per Expert")
+        ax.legend()
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "P12_logdet_bar.png"))
+    except Exception as e:
+        logger.error(f"SA-DIAG | P12 failed: {e}")
+
+
+def _plot_p13_logdet_hist(
+    logdet_metrics: Optional[Dict],
+    expert_names:   List[str],
+    output_dir:     str,
+) -> None:
+    """P13: Histogram of log_det distribution per expert.
+    RealNVP -> shifted; NSF -> heavy tails; NICE -> near zero."""
+    if logdet_metrics is None:
+        logger.warning("SA-DIAG | P13 skipped — logdet_metrics unavailable")
+        return
+    try:
+        names = [n for n in expert_names if n in logdet_metrics]
+        if not names:
+            logger.warning("SA-DIAG | P13 skipped — no experts in logdet_metrics")
+            return
+        K   = len(names)
+        fig, axes = plt.subplots(1, K, figsize=(4 * K, 4), squeeze=False)
+        for i, name in enumerate(names):
+            ld  = logdet_metrics[name]["log_det"].numpy()
+            ax  = axes[0, i]
+            ax.hist(ld, bins=40, color="steelblue", edgecolor="none", alpha=0.8)
+            ax.axvline(float(ld.mean()), color="red", linestyle="--", label=f"mean={ld.mean():.2f}")
+            ax.set_title(name)
+            ax.set_xlabel("log|det J|")
+            ax.set_ylabel("Count" if i == 0 else "")
+            ax.legend(fontsize=8)
+        fig.suptitle("Stage A — log|det J| Distribution per Expert")
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "P13_logdet_hist.png"))
+    except Exception as e:
+        logger.error(f"SA-DIAG | P13 failed: {e}")
+
+
+def _plot_p14_logdet_scatter(
+    logdet_metrics: Optional[Dict],
+    expert_names:   List[str],
+    output_dir:     str,
+) -> None:
+    """P14: Scatter log_det (x) vs log_p(z) (y) per expert.
+    Separates geometry (log_det) from distribution fit (latent Gaussian)."""
+    if logdet_metrics is None:
+        logger.warning("SA-DIAG | P14 skipped — logdet_metrics unavailable")
+        return
+    try:
+        names = [n for n in expert_names if n in logdet_metrics]
+        if not names:
+            logger.warning("SA-DIAG | P14 skipped — no experts in logdet_metrics")
+            return
+        K   = len(names)
+        fig, axes = plt.subplots(1, K, figsize=(4 * K, 4), squeeze=False)
+        for i, name in enumerate(names):
+            ld = logdet_metrics[name]["log_det"].numpy()
+            lp = logdet_metrics[name]["log_p_z"].numpy()
+            ax = axes[0, i]
+            # Subsample for speed if large
+            n_plot = min(len(ld), 2000)
+            idx    = np.random.choice(len(ld), n_plot, replace=False) if len(ld) > n_plot else np.arange(len(ld))
+            ax.scatter(ld[idx], lp[idx], s=4, alpha=0.4, color="steelblue")
+            ax.set_xlabel("log|det J|")
+            ax.set_ylabel("log p(z)" if i == 0 else "")
+            ax.set_title(name)
+        fig.suptitle("Stage A — log|det J| vs log p(z) per Expert")
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "P14_logdet_scatter.png"))
+    except Exception as e:
+        logger.error(f"SA-DIAG | P14 failed: {e}")
+
+
+def _plot_p15_logdet_temporal(
+    epoch_logs:   Dict,
+    expert_names: List[str],
+    logs_ok:      bool,
+    output_dir:   str,
+) -> None:
+    """P15: Temporal mean ± std of log_det over epochs per expert.
+    Detects drift (exploitation) and instability (spikes)."""
+    if not logs_ok:
+        logger.warning("SA-DIAG | P15 skipped — epoch_logs validation failed")
+        return
+    try:
+        has_data = False
+        fig, ax  = plt.subplots(figsize=(8, 4))
+        for name in expert_names:
+            logs = epoch_logs.get(name, {})
+            ld_mean = logs.get("log_det_mean", [])
+            ld_std  = logs.get("log_det_std",  [])
+            if not ld_mean:
+                logger.warning(
+                    f"SA-DIAG | P15: 'log_det_mean' absent for expert '{name}' — "
+                    "requires CSMF-MAIN v1.7+; skipping this expert"
+                )
+                continue
+            epochs = np.arange(1, len(ld_mean) + 1)
+            mu     = np.array(ld_mean, dtype=float)
+            sd     = np.array(ld_std,  dtype=float) if ld_std else np.zeros_like(mu)
+            line,  = ax.plot(epochs, mu, label=name)
+            ax.fill_between(epochs, mu - sd, mu + sd, alpha=0.2, color=line.get_color())
+            has_data = True
+
+        if not has_data:
+            logger.warning("SA-DIAG | P15 skipped — no log_det_mean data in epoch_logs")
+            plt.close(fig)
+            return
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("mean(log|det J|) ± std")
+        ax.set_title("Stage A — Temporal log|det J| Stability per Expert")
+        ax.legend()
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "P15_logdet_temporal.png"))
+    except Exception as e:
+        logger.error(f"SA-DIAG | P15 failed: {e}")
+
+
+# =============================================================================
+# P_PROX1–3: Proximal correction diagnostics [PROX-T] v1.6
+# All non-fatal — log error and return False on failure.
+# =============================================================================
+
+def _plot_pprox1_residual_convergence(
+    prox_diagnostics: Optional[Dict[str, Any]],
+    output_dir: str,
+) -> bool:
+    """
+    P_PROX1: Per-step residual convergence ||Ax^(t)-y||² vs t for max(T_values).
+
+    Confirms each prox step reduces the measurement residual.
+    Skipped gracefully if prox_diagnostics is None.
+    """
+    if prox_diagnostics is None:
+        logger.warning("SA-DIAG | P_PROX1 skipped — prox_diagnostics unavailable")
+        return False
+    try:
+        residual_steps = prox_diagnostics.get("residual_steps", [])
+        if not residual_steps or len(residual_steps) < 2:
+            logger.warning(
+                "SA-DIAG | P_PROX1 skipped — residual_steps has fewer than 2 points "
+                "(need T>=1 in T_values)"
+            )
+            return False
+
+        return plot_prox_residual_convergence(
+            residual_steps = residual_steps,
+            output_path    = os.path.join(output_dir, "P_PROX1_residual_convergence.png"),
+            title          = "Stage A — Proximal Residual Convergence ||Ax^(t)-y||²",
+        )
+    except Exception as e:
+        logger.error(f"SA-DIAG | P_PROX1 failed: {e}")
+        return False
+
+
+def _plot_pprox2_nll_scatter(
+    prox_diagnostics: Optional[Dict[str, Any]],
+    output_dir: str,
+) -> bool:
+    """
+    P_PROX2: Mean residual at T=0,1,2,3 bar chart with NLL baseline annotation.
+
+    Core WP1 M1 evidence: does T>0 reduce residual without wrecking NLL?
+    Skipped gracefully if prox_diagnostics is None.
+    """
+    if prox_diagnostics is None:
+        logger.warning("SA-DIAG | P_PROX2 skipped — prox_diagnostics unavailable")
+        return False
+    try:
+        residuals_by_T = prox_diagnostics.get("residuals_by_T", {})
+        nll_baseline   = prox_diagnostics.get("nll_baseline", float("nan"))
+
+        if not residuals_by_T:
+            logger.warning("SA-DIAG | P_PROX2 skipped — residuals_by_T empty")
+            return False
+
+        return plot_prox_nll_scatter(
+            residuals_by_T = residuals_by_T,
+            nll_baseline   = nll_baseline,
+            output_path    = os.path.join(output_dir, "P_PROX2_residual_vs_T.png"),
+            title          = "Stage A — Residual by T (WP1 M1 Evidence)",
+        )
+    except Exception as e:
+        logger.error(f"SA-DIAG | P_PROX2 failed: {e}")
+        return False
+
+
+def _plot_pprox3_sample_spread(
+    prox_diagnostics: Optional[Dict[str, Any]],
+    output_dir: str,
+) -> bool:
+    """
+    P_PROX3: Sample std before (T=0) vs after (T=max) prox correction.
+
+    Guards against prox collapsing posterior diversity.
+    Skipped gracefully if prox_diagnostics is None.
+    """
+    if prox_diagnostics is None:
+        logger.warning("SA-DIAG | P_PROX3 skipped — prox_diagnostics unavailable")
+        return False
+    try:
+        std_pre  = prox_diagnostics.get("sample_std_pre",  float("nan"))
+        std_post = prox_diagnostics.get("sample_std_post", float("nan"))
+        T_values = prox_diagnostics.get("T_values", [0])
+        T_max    = max(T_values)
+
+        if not np.isfinite(std_pre) or not np.isfinite(std_post):
+            logger.error(
+                f"SA-DIAG | P_PROX3: non-finite std values "
+                f"(pre={std_pre}, post={std_post}) — skipping"
+            )
+            return False
+
+        return plot_prox_sample_spread(
+            sample_std_pre  = std_pre,
+            sample_std_post = std_post,
+            T_max           = T_max,
+            output_path     = os.path.join(output_dir, "P_PROX3_sample_spread.png"),
+            title           = f"Stage A — Sample Spread Before/After Prox (T={T_max})",
+        )
+    except Exception as e:
+        logger.error(f"SA-DIAG | P_PROX3 failed: {e}")
+        return False

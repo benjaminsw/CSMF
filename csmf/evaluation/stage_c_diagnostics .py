@@ -1,31 +1,14 @@
 # =============================================================================
-# Version: DIAG-REORG-StageCDiag-v2.5 | Abbr: SC-DIAG
+# Version: DIAG-REORG-StageCDiag-v2.3 | Abbr: SC-DIAG
 # Description: Stage C diagnostic runner — final system quality + B-vs-C
-#              comparison. Delegates to MU v1.6 and PU v1.5. Saves
-#              stage_c_summary.json. All plots are non-fatal.
-#              All skipped or failed plots logged at WARNING or ERROR level.
+#              comparison. Refactored from v1.1: inline _collect_metrics() and
+#              all _plot_*() functions replaced by MU v1.0 and PU v1.0 calls.
+#              B-vs-C comparison first tries to load stage_b_summary.json
+#              (written by SB-DIAG); falls back to loading the Stage B
+#              checkpoint and running MU collectors if JSON not found.
+#              Public API (run_stage_c_diagnostics signature) unchanged —
+#              backward-compatible with train_csmf.py v2.7.
 # Changelog:
-#   v2.5 (2026-04-19): [RECON-4COL-MIX] Replace P5 (2-row degraded+x̂_mix) with
-#                      P5_recon_4col_mixture.png — 4-row mixture panel using
-#                      PU.plot_recon_panel_4col(stage_label="Stage C",
-#                      expert_name="Mixture"); cycle=argmax-expert x_hat from
-#                      MU.collect_mixture_recon_batch(); generated=csmf.sample(y,1);
-#                      non-fatal if model/val_loader absent.
-#                      [P_PRE_POST_PROX] Add P_pre_post_prox — pre-prox and post-prox
-#                      residual ‖A(x̂)−y‖² per epoch on shared axes + delta line;
-#                      gated on residual_pre_prox key (LS v1.7); non-fatal.
-#                      [P_TRANS_CAL_C] Add P_trans_cal_c — SW2 (trans_loss_c) and
-#                      ES (cal_loss_c) over Stage C epochs; gated on trans_loss_c key
-#                      (LS v1.7); non-fatal.
-#                      [LOSS-COMP-EXT] P_loss_components_c1 extended with cons_pre_loss,
-#                      trans_loss_c, cal_loss_c lines alongside existing terms.
-#   v2.4 (2026-04-17): [PROX-C-ACTIVATE] Add P_prox_rate — line plot of
-#                      prox_applied_rate per epoch (fraction of batches where
-#                      prox_fn fired); y=1.0 reference dashed line (fully
-#                      applied); confirms prox is active in Stage C training;
-#                      gated on has_prox_rate flag; non-fatal; reads
-#                      prox_applied_rate from epoch_logs (LS v1.6 optional key,
-#                      populated by CSMF-MAIN v1.3.15 train_stage_C()).
 #   v2.3 (2026-04-15): [SC-RECFIRST] Replace P_loss_components (NLL/SW2/cal) with
 #                      P_loss_components_c1 (cons_c1, img_loss, alive_penalty) to match
 #                      HYBRID v1.9 forward_stage_c() loss_dict keys; detection flag
@@ -73,7 +56,6 @@ from .metric_utils import (
     collect_gate_metrics,
     collect_reconstruction_metrics,
     collect_reconstruction_batch,
-    collect_mixture_recon_batch,      # [RECON-4COL-MIX] v2.5
 )
 from .plot_utils import (
     plot_epoch_lines,
@@ -83,7 +65,6 @@ from .plot_utils import (
     plot_reconstruction_snapshots,
     plot_comparison_bars,
     plot_residual_boxplot,
-    plot_recon_panel_4col,            # [RECON-4COL-MIX] v2.5
 )
 
 logger = logging.getLogger(__name__)
@@ -148,29 +129,10 @@ def run_stage_c_diagnostics(
         )
 
     optional_present  = available_optional_keys_c(epoch_logs)
-    has_gate_weights  = "gate_weights"      in optional_present
-    has_residual      = "residual"          in optional_present
-    has_snapshots     = "recon_snapshots"   in optional_present
-    has_loss_comps    = "cons_c1"           in optional_present   # [v2.3] SC-RECFIRST keys
-    has_prox_rate     = "prox_applied_rate" in optional_present   # [v2.4] PROX-C-ACTIVATE
-    # [v2.5] New LS v1.7 optional keys
-    has_pre_post_prox = ("residual_pre_prox"  in epoch_logs and
-                         len(epoch_logs.get("residual_pre_prox", [])) > 0)
-    has_trans_cal_c   = ("trans_loss_c"       in epoch_logs and
-                         len(epoch_logs.get("trans_loss_c", [])) > 0)
-    has_cons_pre      = ("cons_pre_loss"      in epoch_logs and
-                         len(epoch_logs.get("cons_pre_loss", [])) > 0)
-
-    if not has_pre_post_prox:
-        logger.warning(
-            "SC-DIAG | 'residual_pre_prox' absent from epoch_logs — "
-            "P_pre_post_prox will be skipped. Requires HYBRID v1.10.0 + LS v1.7."
-        )
-    if not has_trans_cal_c:
-        logger.warning(
-            "SC-DIAG | 'trans_loss_c' absent from epoch_logs — "
-            "P_trans_cal_c will be skipped. Requires HYBRID v1.10.0 + LS v1.7."
-        )
+    has_gate_weights  = "gate_weights"    in optional_present
+    has_residual      = "residual"        in optional_present
+    has_snapshots     = "recon_snapshots" in optional_present
+    has_loss_comps    = "cons_c1"         in optional_present   # [v2.3] SC-RECFIRST keys
 
     # ------------------------------------------------------------------
     # Step 2: Collect Stage C val-set metrics (MU)
@@ -211,7 +173,7 @@ def run_stage_c_diagnostics(
     )
 
     # ------------------------------------------------------------------
-    # Step 4: Plots — all non-fatal; skips logged at WARNING or ERROR
+    # Step 4: Plots — core 7 + optional P3b
     # ------------------------------------------------------------------
 
     # P1: Joint loss train/val over epochs
@@ -226,21 +188,16 @@ def run_stage_c_diagnostics(
     # P3b: Gate weights over epochs (optional, when epoch_logs["gate_weights"] present)
     if has_gate_weights:
         _plot_p3b_gate_weights_epochs(epoch_logs, expert_names, output_dir)
-    else:
-        logger.warning("SC-DIAG | P3b skipped — 'gate_weights' absent from epoch_logs")
 
     # P3c: Alive experts vs epoch (optional, same gate on has_gate_weights)
     if has_gate_weights:
         _plot_p3c_alive_experts(epoch_logs, expert_names, len(expert_names), output_dir)
-    else:
-        logger.warning("SC-DIAG | P3c skipped — 'gate_weights' absent from epoch_logs")
 
     # P4: Residual over epochs
     _plot_p4_residual_epochs(epoch_logs, has_residual, logs_ok, output_dir)
 
-    # P5: Mixture 4-col panel: Original/Degraded/Cycle(argmax)/Generated(sample) [v2.5 RECON-4COL-MIX]
-    # Replaces old 2-row grid (degraded+x̂_mix) — matches Stage A/B structure
-    _plot_p5_recon_4col_mixture(csmf_model, val_loader, output_dir)
+    # P5: Final reconstruction grid (encode→decode via MU)
+    _plot_p5_recon_grid(recon_c, expert_names, output_dir)
 
     # P6: Reconstruction snapshots over epochs
     _plot_p6_recon_snapshots(epoch_logs, has_snapshots, output_dir)
@@ -255,20 +212,11 @@ def run_stage_c_diagnostics(
         output_dir   = output_dir,
     )
 
-    # P_loss_components_c1: SC-RECFIRST loss components over epochs [v2.3 + LOSS-COMP-EXT v2.5]
-    _plot_p_loss_components(epoch_logs, has_loss_comps, has_cons_pre, has_trans_cal_c, output_dir)
+    # P_loss_components_c1: SC-RECFIRST loss components over epochs [v2.3]
+    _plot_p_loss_components(epoch_logs, has_loss_comps, output_dir)
 
     # P_neff_c1: Neff from reconstruction-first loss over epochs [v2.3]
     _plot_p_neff_c1(epoch_logs, output_dir)
-
-    # P_prox_rate: Prox application rate per epoch [v2.4 PROX-C-ACTIVATE]
-    _plot_p_prox_rate(epoch_logs, has_prox_rate, output_dir)
-
-    # P_pre_post_prox: Pre vs post-prox residual per epoch [v2.5 P_PRE_POST_PROX]
-    _plot_p_pre_post_prox(epoch_logs, has_pre_post_prox, output_dir)
-
-    # P_trans_cal_c: SW2 + ES loss over Stage C epochs [v2.5 P_TRANS_CAL_C]
-    _plot_p_trans_cal_c(epoch_logs, has_trans_cal_c, output_dir)
 
     # ------------------------------------------------------------------
     # Step 5: Build and save stage_c_summary.json
@@ -633,58 +581,42 @@ def _plot_p4_residual_epochs(
         logger.error(f"SC-DIAG | P4 failed: {e}")
 
 
-def _plot_p5_recon_4col_mixture(
-    csmf_model: Any,
-    val_loader: Any,
-    output_dir: str,
+def _plot_p5_recon_grid(
+    recon_c: Optional[Dict], expert_names: List[str], output_dir: str
 ) -> None:
-    """P5: Mixture 4-row panel: Original / Degraded / Cycle / Generated. [v2.5 RECON-4COL-MIX]
-
-    Replaces old 2-row grid (degraded + x̂_mix). Matches Stage A/B structure.
-    Cycle  = argmax-expert encode→decode from sample_all_experts().
-    Generated = gate-sampled generation from csmf_model.sample(y, 1).
-    Logged at ERROR and skipped if collection fails (non-fatal).
     """
-    if csmf_model is None or val_loader is None:
-        logger.warning(
-            "SC-DIAG | P5 skipped — csmf_model or val_loader not available"
-        )
+    P5: Final reconstruction grid from Stage C model (encode→decode via MU).
+    2-row layout: row 0 = degraded y, row 1 = mixture x̂.
+    """
+    if recon_c is None:
+        logger.warning("SC-DIAG | P5 skipped — recon_c collection failed")
         return
     try:
-        import torch
-        device     = csmf_model.device
-        mix_batch  = collect_mixture_recon_batch(
-            csmf_model = csmf_model,
-            val_loader = val_loader,
-            device     = device,
-            n_samples  = 8,
-        )
-        if mix_batch is None:
-            logger.error(
-                "SC-DIAG | P5 skipped — collect_mixture_recon_batch returned None"
-            )
+        y_imgs  = recon_c.get("y")
+        xh_dict = recon_c.get("x_hat", {})
+
+        # For Stage C grid, use first expert's reconstruction as representative
+        # (mixture reconstruction via csmf.sample() is in MU.collect_reconstruction_metrics)
+        # Here we show per-expert encode→decode from collect_reconstruction_batch
+        if not xh_dict or y_imgs is None:
+            logger.warning("SC-DIAG | P5: no image data from collect_reconstruction_batch")
             return
 
-        ok = plot_recon_panel_4col(
-            x_clean     = mix_batch.get("x_clean"),
-            y           = mix_batch.get("y"),
-            x_cycle     = mix_batch.get("x_cycle_mix"),
-            x_gen       = mix_batch.get("x_gen_mix"),
-            expert_name = "Mixture",
-            output_path = os.path.join(output_dir, "P5_recon_4col_mixture.png"),
-            n_samples   = 8,
-            stage_label = "Stage C",    # [STAGE-LABEL] PU v1.5
-        )
-        if not ok:
-            logger.error(
-                "SC-DIAG | P5: plot_recon_panel_4col returned False — "
-                "check PU logs for details"
-            )
-        else:
-            logger.info("SC-DIAG | P5: P5_recon_4col_mixture.png saved")
+        xhat_named = {
+            expert_names[k]: v
+            for k, v in xh_dict.items()
+            if k < len(expert_names) and v is not None
+        }
 
+        plot_reconstruction_grid(
+            y           = y_imgs,
+            output_path = os.path.join(output_dir, "P5_recon_grid_final.png"),
+            title       = "Stage C — Final Reconstruction Grid (encode→decode per expert)",
+            x_clean     = recon_c.get("x_clean"),
+            x_hat       = xhat_named,
+        )
     except Exception as e:
-        logger.error("SC-DIAG | P5 failed: %s", e)
+        logger.error(f"SC-DIAG | P5 failed: {e}")
 
 
 def _plot_p6_recon_snapshots(
@@ -827,51 +759,45 @@ def _plot_p7_b_vs_c(
 # =============================================================================
 
 def _plot_p_loss_components(
-    epoch_logs:     Dict,
+    epoch_logs:    Dict,
     has_loss_comps: bool,
-    has_cons_pre:   bool,    # [LOSS-COMP-EXT] v2.5
-    has_trans_cal_c: bool,   # [LOSS-COMP-EXT] v2.5
-    output_dir:     str,
+    output_dir:    str,
 ) -> None:
-    """P_loss_components_c1: Per-component Stage C loss over epochs. [v2.3 + LOSS-COMP-EXT v2.5]
+    """P_loss_components_c1: Per-component reconstruction-first Stage C loss over epochs.
 
-    Plots cons_c1, img_loss, alive_penalty + cons_pre_loss, trans_loss_c, cal_loss_c.
-    Falls back gracefully: warns and returns if all keys absent. Non-fatal.
+    [v2.3 SC-RECFIRST] Plots cons_c1, img_loss, alive_penalty as separate lines.
+    Replaces old NLL/SW2/cal plot — those keys no longer present in Stage C.
+    Falls back gracefully: logs warning and returns if keys absent.
+    Non-fatal.
     """
-    if not has_loss_comps and not has_cons_pre and not has_trans_cal_c:
+    if not has_loss_comps:
         logger.warning(
-            "SC-DIAG | P_loss_components_c1 skipped — no loss component keys present "
-            "in epoch_logs. Requires HYBRID v1.10.0 + LS v1.7."
+            "SC-DIAG | P_loss_components_c1 skipped — SC-RECFIRST keys absent "
+            "(cons_c1 not in epoch_logs; old NLL-based Stage C?)"
         )
         return
     try:
         data = {}
         for key, label in [
-            ("cons_c1",       "Post-prox cons (λ_cons)"),
-            ("cons_pre_loss", "Pre-prox cons (λ_cons_pre)"),   # [LOSS-COMP-EXT] v2.5
-            ("img_loss",      "Image recon (λ_img)"),
-            ("alive_penalty", "Alive penalty (λ_alive)"),
-            ("trans_loss_c",  "SW2 transport (λ_trans_c)"),    # [LOSS-COMP-EXT] v2.5
-            ("cal_loss_c",    "ES calibration (λ_cal_c)"),     # [LOSS-COMP-EXT] v2.5
+            ("cons_c1",       "Consistency λ_cons·‖A(x̂_mix)−y‖²"),
+            ("img_loss",      "Image Recon λ_img·‖x̂_mix−x‖²"),
+            ("alive_penalty", "Alive Penalty λ_alive·max(0,1.5−Neff)"),
         ]:
             vals = epoch_logs.get(key, [])
             if vals:
                 data[label] = vals
         if not data:
-            logger.warning("SC-DIAG | P_loss_components_c1: all component lists empty — skipping")
+            logger.warning("SC-DIAG | P_loss_components_c1: all component lists empty")
             return
-        ok = plot_epoch_lines(
+        plot_epoch_lines(
             data_dict   = data,
             output_path = os.path.join(output_dir, "P_loss_components_c1.png"),
             title       = "Stage C — Reconstruction-First Loss Components per Epoch",
             ylabel      = "Loss",
         )
-        if not ok:
-            logger.error("SC-DIAG | P_loss_components_c1: plot_epoch_lines returned False")
-        else:
-            logger.info("SC-DIAG | P_loss_components_c1 saved")
+        logger.info("SC-DIAG | P_loss_components_c1 saved")
     except Exception as e:
-        logger.error("SC-DIAG | P_loss_components_c1 failed: %s", e)
+        logger.error(f"SC-DIAG | P_loss_components_c1 failed: {e}")
 
 
 def _plot_p_neff_c1(
@@ -912,56 +838,6 @@ def _plot_p_neff_c1(
         logger.info("SC-DIAG | P_neff_c1 saved: %s", out)
     except Exception as e:
         logger.error("SC-DIAG | P_neff_c1 failed: %s", e)
-
-
-def _plot_p_prox_rate(
-    epoch_logs: Dict,
-    has_prox_rate: bool,
-    output_dir: str,
-) -> None:
-    """P_prox_rate: Prox application rate per epoch.
-
-    [v2.4 PROX-C-ACTIVATE] Reads prox_applied_rate from epoch_logs —
-    fraction of batches in each epoch where prox_fn actually fired.
-    A rate of 1.0 (dashed reference) means prox was applied every batch.
-    Rate < 1.0 indicates prox_fn raised exceptions on some batches (see
-    forward_stage_c logs for details). Non-fatal.
-    """
-    if not has_prox_rate:
-        logger.warning(
-            "SC-DIAG | P_prox_rate skipped — prox_applied_rate absent from epoch_logs "
-            "(requires CSMF-MAIN v1.3.15 train_stage_C() and LS v1.6)"
-        )
-        return
-    vals = epoch_logs.get("prox_applied_rate", [])
-    if not vals:
-        logger.warning("SC-DIAG | P_prox_rate skipped — prox_applied_rate list is empty")
-        return
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        epochs = list(range(1, len(vals) + 1))
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(epochs, vals, color="#FAA43A", linewidth=2, marker="o",
-                markersize=4, label="Prox applied rate")
-        ax.axhline(1.0, color="green", linestyle="--", linewidth=1.5,
-                   label="Fully applied (rate = 1.0)")
-        ax.axhline(0.0, color="red",   linestyle=":",  linewidth=1.0)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Fraction of batches")
-        ax.set_title("Stage C — Proximal Correction Application Rate",
-                     fontweight="bold")
-        ax.set_ylim(-0.05, 1.1)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        out = os.path.join(output_dir, "P_prox_rate.png")
-        fig.savefig(out, dpi=120)
-        plt.close(fig)
-        logger.info("SC-DIAG | P_prox_rate saved: %s", out)
-    except Exception as e:
-        logger.error("SC-DIAG | P_prox_rate failed: %s", e)
 
 
 # =============================================================================
@@ -1075,111 +951,3 @@ def _build_summary(
         "val_metrics_c":    val_metrics_c,
         "stage_b_vs_c":     bvc,
     }
-
-
-# =============================================================================
-# New plot helpers — SC-DIAG v2.5
-# =============================================================================
-
-def _plot_p_pre_post_prox(
-    epoch_logs:       Dict,
-    has_pre_post_prox: bool,
-    output_dir:       str,
-) -> None:
-    """P_pre_post_prox: Pre-prox vs post-prox residual per epoch. [v2.5 P_PRE_POST_PROX]
-
-    Shows ‖A(x̂_mix)−y‖² (before prox) and ‖A(x̂_corr)−y‖² (after prox) on
-    shared axes. Quantifies how much prox actually corrects per epoch.
-    Logged at WARNING if key absent. Non-fatal.
-    """
-    if not has_pre_post_prox:
-        logger.warning(
-            "SC-DIAG | P_pre_post_prox skipped — 'residual_pre_prox' absent from "
-            "epoch_logs. Requires HYBRID v1.10.0 + CSMF-MAIN accumulating loss_dict keys."
-        )
-        return
-    try:
-        pre  = epoch_logs.get("residual_pre_prox",  [])
-        post = epoch_logs.get("residual_post_prox", [])
-
-        if not pre:
-            logger.warning("SC-DIAG | P_pre_post_prox: residual_pre_prox list empty — skipping")
-            return
-
-        data: Dict[str, list] = {"Pre-prox ‖A(x̂_mix)−y‖²": pre}
-        if post:
-            data["Post-prox ‖A(x̂_corr)−y‖²"] = post
-
-            # Compute delta = post - pre per epoch for magnitude check
-            import numpy as np
-            delta = [p - q for p, q in zip(post, pre)]
-            data["Delta (post − pre)"] = delta
-        else:
-            logger.warning(
-                "SC-DIAG | P_pre_post_prox: residual_post_prox absent — "
-                "plotting pre-prox only"
-            )
-
-        ok = plot_epoch_lines(
-            data_dict   = data,
-            output_path = os.path.join(output_dir, "P_pre_post_prox.png"),
-            title       = "Stage C — Pre vs Post-Prox Residual ‖A(x̂)−y‖² per Epoch",
-            ylabel      = "MSE Residual",
-            hlines      = [(0.0, "Zero", "gray")],
-        )
-        if not ok:
-            logger.error(
-                "SC-DIAG | P_pre_post_prox: plot_epoch_lines returned False — "
-                "check PU logs for details"
-            )
-        else:
-            logger.info("SC-DIAG | P_pre_post_prox: saved")
-    except Exception as e:
-        logger.error("SC-DIAG | P_pre_post_prox failed: %s", e)
-
-
-def _plot_p_trans_cal_c(
-    epoch_logs:    Dict,
-    has_trans_cal_c: bool,
-    output_dir:    str,
-) -> None:
-    """P_trans_cal_c: SW2 + ES loss over Stage C epochs. [v2.5 P_TRANS_CAL_C]
-
-    Verifies geometry (SW2) and calibration (ES) terms are active and not
-    dominating reconstruction. Logged at WARNING if key absent. Non-fatal.
-    """
-    if not has_trans_cal_c:
-        logger.warning(
-            "SC-DIAG | P_trans_cal_c skipped — 'trans_loss_c' absent from epoch_logs. "
-            "Requires HYBRID v1.10.0 + CSMF-MAIN accumulating loss_dict keys."
-        )
-        return
-    try:
-        data = {}
-        for key, label in [
-            ("trans_loss_c", "SW2 transport (λ_trans_c)"),
-            ("cal_loss_c",   "ES calibration (λ_cal_c)"),
-        ]:
-            vals = epoch_logs.get(key, [])
-            if vals:
-                data[label] = vals
-
-        if not data:
-            logger.warning("SC-DIAG | P_trans_cal_c: both trans_loss_c and cal_loss_c empty — skipping")
-            return
-
-        ok = plot_epoch_lines(
-            data_dict   = data,
-            output_path = os.path.join(output_dir, "P_trans_cal_c.png"),
-            title       = "Stage C — Transport (SW2) and Calibration (ES) Loss per Epoch",
-            ylabel      = "Loss",
-        )
-        if not ok:
-            logger.error(
-                "SC-DIAG | P_trans_cal_c: plot_epoch_lines returned False — "
-                "check PU logs for details"
-            )
-        else:
-            logger.info("SC-DIAG | P_trans_cal_c: saved")
-    except Exception as e:
-        logger.error("SC-DIAG | P_trans_cal_c failed: %s", e)

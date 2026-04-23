@@ -1,9 +1,14 @@
 """
 Conditional Affine Coupling Layers for CSMF
 
-Version: WP0.2-Coupling-v1.9.0
-Last Modified: 2026-04-06
+Version: WP0.2-Coupling-v1.9.1
+Last Modified: 2026-04-11
 Changelog:
+  v1.9.1 (2026-04-11): [ACTNORM-CLAMP] Tighten ActNorm log_scale clamp [-3,3] → [-0.5, 0.5]
+                        — [-3,3] too permissive: 9 ActNorms × 784 dims × 3.0 = 21,168 max
+                        log_det vs coupling max 1,764 (s_max=0.5, 392 dims × 9 layers);
+                        observed RealNVP log_det=13,377 confirms ActNorm averaging ~1.9/dim;
+                        tightened clamp caps ActNorm at 3,528, matching coupling-layer scale
   v1.9.0 (2026-04-06): [ACTNORM-CLAMP] Clamp log_scale in ActNorm.forward() to [-3, 3] —
                         unclamped log_scale caused RealNVP NLL to decrease linearly to -22000
                         over 50 epochs via log-det exploitation (784 dims × N ActNorm layers
@@ -685,8 +690,11 @@ class ActNorm(nn.Module):
         B = x.shape[0]
         # [ACTNORM-CLAMP] Clamp log_scale to prevent log-det exploitation —
         # unclamped log_scale.sum() over 784 dims drives NLL → -∞ linearly.
+        # [v1.9.1] Tightened from [-3, 3] → [-0.5, 0.5] to match coupling-layer
+        # scale budget (s_max=0.5); caps ActNorm max log_det at 3,528
+        # (9 layers × 784 dims × 0.5) vs prior max 21,168 with [-3,3].
         # Parameter itself is unchanged; gradient still flows through clamp.
-        ls = self.log_scale.clamp(-3.0, 3.0)
+        ls = self.log_scale.clamp(-0.5, 0.5)
         # log_det per sample: sum of log_scale (same for all samples)
         log_det_per_dim = ls.sum()   # scalar
 

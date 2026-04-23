@@ -1,19 +1,21 @@
 """
 Conditional Cubic Spline Flow (CSF) with FiLM Conditioning
 
-Version: WP0.3-CondCSF-v1.0
+Version: WP0.3-CondCSF-v1.4
 Abbr: COND-CSF
-Last Modified: 2026-04-02
+Last Modified: 2026-04-18
 Changelog:
-  v1.0 (2026-04-02): Initial implementation. Steffen monotonic cubic spline coupling
-                     layers with FiLM conditioning (xA→NN_hidden→FiLM(u,h)→θ→spline→xB).
-                     Sigmoid/logit domain wrapping per coupling layer handles unconstrained
-                     input (spline domain [0,1]→[0,1]). Fixed alternating reverse permutation
-                     between layers — LU-decomposed linear layers deferred to v1.1 pending
-                     stability validation. Newton inverse (8 steps) with linear initialisation
-                     — Blinn analytical cubic solver deferred to v1.1. External h API:
-                     forward(x,h)→(z,log_det); inverse(z,h)→x, matching COND-NICE/COND-NSF
-                     convention. cond_dim alias added for train_csmf.py compatibility.
+  v1.4 (2026-04-18): [CSF-CASCADE-FIX] K 4→6, keep n_flows=1. Root cause of NLL=+1299
+                     with n_flows=2: sigmoid cascade across coupling layers. After layer 1,
+                     zB=logit(spline(sigmoid(xB))) is back in ℝ. Layer 2 applies sigmoid(zB)
+                     where zB can be large-magnitude (±5), giving sigmoid(±5)≈0.007,
+                     log|sigmoid'|≈−5/dim × 392 dims ≈ −1960 log_det penalty → NLL=+1299.
+                     n_flows=1 avoids this — single coupling layer has no inter-layer cascade.
+                     K=4 raised to K=6 for expressivity (K=4 was too restrictive for MNIST).
+  v1.3 (2026-04-18): [CSF-REVERT] n_flows 1→2, K 4→6. Reverted in v1.4.
+  v1.2 (2026-04-18): [CSF-SIMPLIFY] n_flows 2→1, K 8→4.
+  v1.1 (2026-04-18): [INV-BISECT] Bisection-Newton hybrid inverse solver.
+  v1.0 (2026-04-02): Initial implementation.
 Dependencies: torch>=2.0, film WP0.1-FiLM-v1.0+
 """
 
@@ -33,7 +35,7 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_VERSION = "WP0.3-CondCSF-v1.0"
+_VERSION = "WP0.3-CondCSF-v1.4"
 _ABBR    = "COND-CSF"
 
 
@@ -173,19 +175,27 @@ def _steffen_spline_inverse(
     heights: torch.Tensor, # (N, K) raw
     bd: torch.Tensor,      # (N, 2) raw
     eps: float = 1e-5,
-    newton_steps: int = 32,
+    n_steps: int = 32,
+    eps_newton: float = 1e-3,
 ) -> torch.Tensor:
     """
-    Invert the Steffen cubic spline using Newton's method.
+    [INV-BISECT] Invert the Steffen cubic spline via bisection-Newton hybrid.
 
-    Finds x ∈ [0, 1] s.t. spline(x) = y via:
-      1. Binary-search bin using y-knots.
-      2. Linear initial estimate: xi_init = (y - a0) / a1.
-      3. 8 Newton steps: xi_{n+1} = xi_n - f(xi_n) / f'(xi_n),
-         clamped to [0, w_k] each step.
+    Finds x ∈ [0, 1] s.t. spline(x) = y.
+
+    Algorithm:
+      - Maintain bracket [lo, hi] with f(lo)<=0, f(hi)>=0 (guaranteed by
+        Steffen monotonicity: f(0)=a0-y<=0, f(w_k)=y_knots[k+1]-y>=0).
+      - Each step: propose Newton candidate xi - f(xi)/f'(xi).
+        Accept if fp > eps_newton AND candidate is inside [lo, hi].
+        Otherwise use bisection midpoint (lo+hi)/2.
+      - Evaluate f at the NEW xi and update bracket from its sign.
+        (Key fix vs prior attempt: bracket must be updated from f at the
+        accepted point, not f at the previous point.)
+      - Precision after n_steps=32: w_k/2^32 < 1e-10 (worst-case bisection).
 
     Note: Blinn analytical cubic solver (Durkan et al. 2019, App. A.3)
-    deferred to v1.1 pending numerical validation on MNIST inputs.
+    deferred to v1.2.
 
     Returns:
         x: (N,) values in [0, 1]
@@ -217,24 +227,38 @@ def _steffen_spline_inverse(
     x0 = _g(x_knots[:, :-1])
     w_k = _g(w)   # bin width (upper bound for local coord xi)
 
-    # Linear initialisation: solve a0 + a1*xi = y → xi = (y-a0)/a1
-    #xi = ((y - a0) / a1.clamp(min=eps)).clamp(0.0, w_k)
-    xi = ((y - a0) / a1.clamp(min=eps)).clamp(min=0.0)
-    xi = torch.minimum(xi, w_k)
+    # [INV-BISECT] Initial bracket guaranteed by Steffen monotonicity:
+    #   f(0)   = a0 - y = y_knots[k] - y <= 0  (y is in bin k, so y >= y_knots[k])
+    #   f(w_k) = y_knots[k+1] - y       >= 0
+    lo = torch.zeros_like(y)
+    hi = w_k.clone()
+    xi = w_k / 2.0   # midpoint start — always inside bracket
 
-    # Newton refinement
-    for step in range(newton_steps):
+    for step in range(n_steps):
+        # Evaluate f and f' at current estimate
         f  = a0 + xi * (a1 + xi * (a2 + xi * a3)) - y
         fp = a1 + xi * (2.0 * a2 + 3.0 * a3 * xi)
-        fp = fp.clamp(min=eps)
 
         if torch.isnan(f).any() or torch.isnan(fp).any():
-            logger.error(f"COND-CSF | Newton step {step}: NaN in f or f'")
-            raise RuntimeError(f"NaN in spline Newton step {step}")
+            logger.error(f"COND-CSF | [INV-BISECT] step {step}: NaN in f or f'")
+            raise RuntimeError(f"[INV-BISECT] NaN in spline inverse step {step}")
 
-        #xi = (xi - f / fp).clamp(0.0, w_k)
-        xi = (xi - f / fp).clamp(min=0.0)
-        xi = torch.minimum(xi, w_k)
+        # Newton candidate
+        xi_newton = xi - f / fp.clamp(min=eps_newton)
+
+        # Accept Newton only when derivative is healthy AND result stays in bracket
+        newton_ok = (fp > eps_newton) & (xi_newton >= lo) & (xi_newton <= hi)
+
+        # Bisection fallback: guaranteed to halve the bracket
+        xi_bisect = (lo + hi) / 2.0
+
+        xi = torch.where(newton_ok, xi_newton, xi_bisect)
+
+        # [KEY FIX] Evaluate f at the NEW xi, then update bracket from its sign.
+        # Using f from the OLD xi here (as the prior attempt did) corrupts the bracket.
+        f_new = a0 + xi * (a1 + xi * (a2 + xi * a3)) - y
+        lo = torch.where(f_new <= 0.0, xi, lo)
+        hi = torch.where(f_new >  0.0, xi, hi)
 
     x = (x0 + xi).clamp(0.0, 1.0)
     return x
@@ -475,8 +499,8 @@ class ConditionalCSF(nn.Module):
         dim: int = 784,
         h_dim: int = 64,
         cond_dim: Optional[int] = None,   # alias for h_dim (train_csmf compatibility)
-        n_flows: int = 2,
-        K: int = 8,
+        n_flows: int = 1,
+        K: int = 6,
         hidden_dims: Optional[List[int]] = None,
     ):
         """

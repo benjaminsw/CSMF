@@ -1,5 +1,5 @@
 # =============================================================================
-# Version: DIAG-REORG-MetricUtils-v1.1 | Abbr: MU
+# Version: DIAG-REORG-MetricUtils-v1.6 | Abbr: MU
 # Description: Shared metric collectors for CSMF diagnostic scripts.
 #              Extracted from EXP-SANITY v1.1, FI-DIAG v1.5, SC-DIAG v1.1.
 #              Called by SA-DIAG, SB-DIAG, SC-DIAG. Each function is
@@ -7,6 +7,34 @@
 #              return None on failure (non-fatal); callers decide whether to
 #              skip or abort. All errors logged via module logger.
 # Changelog:
+#   v1.6 (2026-04-19): [MIX-RECON] Add collect_mixture_recon_batch() — Stage C
+#                      mixture 4-col data: cycle=argmax-expert x_hat from
+#                      sample_all_experts(); generated=csmf.sample(y,1); reshapes
+#                      flat (B,784)→(B,1,28,28); NaN guard on each step; returns
+#                      None on failure with error log.
+#                      [FI-GATE] Add collect_fi_gate_comparison() — loads
+#                      fi_diag_summary.json from known output path; extracts fi_mean
+#                      per expert; collects current gate weights from val_loader;
+#                      returns None with warning log if JSON missing (non-fatal).
+#   v1.5 (2026-04-18): [P4-4COL] Extend collect_reconstruction_batch to also
+#                      collect x_gen per expert: z~N(0,I) → _expert_inverse,
+#                      unconditional per-expert generation (gate-independent).
+#                      Reshape applied to x_gen same as x_hat. Return dict now
+#                      includes "x_gen": {k: Tensor(n,1,28,28)|None}.
+#   v1.4 (2026-04-18): [RECON-RESHAPE] Reshape (B,784)→(B,1,28,28) in
+#                      collect_reconstruction_batch. [LOGDET-FIX] Remove stale
+#                      x_in= kwarg from collect_logdet_decomposition.
+#   v1.3 (2026-04-17): [PROX-T] Add collect_prox_diagnostics().
+#                      via csmf_model.sample(num_prox_steps=0), then manually
+#                      applies gradient prox steps for T in T_values; computes
+#                      per-step residual ||Ax^(t)-y||² independently (no PROX
+#                      API dependency); returns residuals_by_T, residual_steps,
+#                      sample_std_pre/post, nll_baseline; returns None on failure
+#   v1.2 (2026-04-11): [LOGDET-DIAG] Add collect_logdet_decomposition() —
+#                      iterates val_loader, calls _expert_forward per expert,
+#                      returns per-expert {log_det: Tensor(N,), log_p_z: Tensor(N,),
+#                      D: int}; used by SA-DIAG v1.5 P12–P14; NaN batches skipped
+#                      with error log; returns None if no batches collected
 #   v1.1 (2026-04-04): BUG FIX — removed fisher_info_diag import attempt and
 #                      fallback from compute_fi_option_a_batch; inline
 #                      implementation is now the sole implementation; fisher_info_diag
@@ -19,6 +47,7 @@
 # Dependencies: CSMF-MAIN v1.3.24+, torch, numpy
 # =============================================================================
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -575,10 +604,46 @@ def collect_reconstruction_batch(
                 f"| {n} samples OK"
             )
 
+    # [RECON-RESHAPE] Reshape flat (B,784) to (B,1,28,28) for plot_reconstruction_grid.
+    # Non-image experts (NSF, NICE, CSF) return flat tensors from _expert_inverse.
+    for k in list(x_hat_per_expert.keys()):
+        t = x_hat_per_expert[k]
+        if t is not None and t.dim() == 2 and t.shape[-1] == 784:
+            x_hat_per_expert[k] = t.view(t.shape[0], 1, 28, 28)
+            logger.info(f"MU | collect_reconstruction_batch: expert={k} reshaped (B,784)→(B,1,28,28)")
+
+    # [P4-4COL] Collect generated samples per expert: z~N(0,I) → _expert_inverse.
+    # This is unconditional per-expert generation (gate-independent), not gate-weighted
+    # sampling. Gives a direct view of what each expert's prior looks like conditioned on y.
+    x_gen_per_expert: Dict[int, Optional[torch.Tensor]] = {}
+    dim = csmf_model.dim
+    for k, expert in enumerate(csmf_model.experts):
+        generated = []
+        try:
+            for i in range(n):
+                z = torch.randn(1, dim, device=x_clean.device)
+                x_g = csmf_model._expert_inverse(
+                    expert, z, y_deg[i:i+1], h[i:i+1], z_factored_list=None
+                )
+                generated.append(x_g.cpu())
+            x_gen_k = torch.cat(generated, dim=0)
+            # Reshape flat if needed
+            if x_gen_k.dim() == 2 and x_gen_k.shape[-1] == 784:
+                x_gen_k = x_gen_k.view(x_gen_k.shape[0], 1, 28, 28)
+            x_gen_per_expert[k] = x_gen_k
+            logger.info(f"MU | collect_reconstruction_batch: expert={k} generated {n} samples OK")
+        except Exception as e:
+            logger.error(
+                f"MU | collect_reconstruction_batch: generation failed | "
+                f"expert={k} ({expert_names[k]}): {e}"
+            )
+            x_gen_per_expert[k] = None
+
     return {
         "y":       y_deg.cpu(),
         "x_clean": x_clean.cpu(),
         "x_hat":   x_hat_per_expert,
+        "x_gen":   x_gen_per_expert,
     }
 
 
@@ -765,4 +830,611 @@ def collect_reconstruction_metrics(
         "residual_mean": residual_mean,
         "residual_std":  residual_std,
         "residuals_all": residuals_all,
+    }
+
+
+# =============================================================================
+# collect_logdet_decomposition
+# Source: [LOGDET-DIAG] v1.2 — new function
+# =============================================================================
+
+@torch.no_grad()
+def collect_logdet_decomposition(
+    csmf_model,
+    val_loader,
+    device: torch.device,
+    max_batches: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """
+    Collect per-expert log_det and log_p(z) decomposition from the val set.
+
+    For each val batch, runs _expert_forward per expert to get log_det [B] and
+    computes log_p_z [B] from base_dist. Aggregates across batches.
+
+    Args:
+        csmf_model  : CSMF model (eval mode set internally).
+        val_loader  : DataLoader yielding (x_clean, y_deg).
+        device      : Compute device.
+        max_batches : Max val batches to collect (speed control).
+
+    Returns:
+        Dict mapping expert_name (str) ->
+            {
+                "log_det"  : Tensor(N,),   # per-sample log|det J|
+                "log_p_z"  : Tensor(N,),   # per-sample log p(z)
+                "D"        : int,           # input dimension (for per-dim normalisation)
+            }
+        or None if no batches collected for any expert.
+    """
+    csmf_model.eval()
+    K            = csmf_model.K
+    expert_names = [type(e).__name__ for e in csmf_model.experts]
+    D            = csmf_model.dim  # input dimension
+
+    log_det_accum : Dict[int, list] = {k: [] for k in range(K)}
+    log_p_z_accum : Dict[int, list] = {k: [] for k in range(K)}
+    n_collected = 0
+
+    for x_clean, y_deg in val_loader:
+        if n_collected >= max_batches:
+            break
+        x_clean = x_clean.to(device)
+        y_deg   = y_deg.to(device)
+
+        try:
+            h = csmf_model.conditioner(y_deg)
+        except Exception as e:
+            logger.error(f"MU | collect_logdet_decomposition: conditioner failed batch={n_collected}: {e}")
+            continue
+
+        batch_ok = True
+        for k, expert in enumerate(csmf_model.experts):
+            try:
+                z, log_det, log_prob, _ = csmf_model._expert_forward(
+                    expert, x_clean, y_deg, h
+                )
+
+                if torch.isnan(log_det).any():
+                    logger.error(
+                        f"MU | collect_logdet_decomposition: NaN log_det | "
+                        f"expert={k} ({expert_names[k]}) batch={n_collected} — skipping batch"
+                    )
+                    batch_ok = False
+                    break
+
+                z_flat  = z.flatten(1) if z.dim() > 2 else z
+                log_p_z = csmf_model.base_dist.log_prob(z_flat).sum(dim=1)  # [B]
+
+                if torch.isnan(log_p_z).any():
+                    logger.error(
+                        f"MU | collect_logdet_decomposition: NaN log_p_z | "
+                        f"expert={k} ({expert_names[k]}) batch={n_collected} — skipping batch"
+                    )
+                    batch_ok = False
+                    break
+
+                log_det_accum[k].append(log_det.cpu())
+                log_p_z_accum[k].append(log_p_z.cpu())
+
+            except Exception as e:
+                logger.error(
+                    f"MU | collect_logdet_decomposition: expert={k} ({expert_names[k]}) "
+                    f"batch={n_collected} exception: {e} — skipping batch"
+                )
+                batch_ok = False
+                break
+
+        if batch_ok:
+            n_collected += 1
+
+    if n_collected == 0:
+        logger.error("MU | collect_logdet_decomposition: no batches collected — returning None")
+        return None
+
+    result: Dict[str, Any] = {}
+    for k in range(K):
+        name = expert_names[k]
+        if not log_det_accum[k]:
+            logger.error(
+                f"MU | collect_logdet_decomposition: no data for expert={k} ({name})"
+            )
+            continue
+        ld = torch.cat(log_det_accum[k])  # (N,)
+        lp = torch.cat(log_p_z_accum[k])  # (N,)
+        result[name] = {
+            "log_det": ld,
+            "log_p_z": lp,
+            "D":       D,
+        }
+        logger.info(
+            f"MU | collect_logdet_decomposition: expert={k} ({name}) | "
+            f"N={ld.shape[0]} | log_det_mean={ld.mean():.4f} | "
+            f"log_p_z_mean={lp.mean():.4f} | D={D}"
+        )
+
+    if not result:
+        logger.error("MU | collect_logdet_decomposition: all experts failed — returning None")
+        return None
+
+    return result
+
+
+# =============================================================================
+# collect_prox_diagnostics
+# [PROX-T] v1.3 — new function
+# =============================================================================
+
+@torch.no_grad()
+def collect_prox_diagnostics(
+    csmf_model,
+    val_loader,
+    A_fn,
+    At_fn,
+    device: torch.device,
+    T_values: Optional[List[int]] = None,
+    lam: float = 0.1,
+    max_batches: int = 10,
+    num_samples: int = 4,
+) -> Optional[Dict[str, Any]]:
+    """
+    Collect proximal correction diagnostics for P_PROX1, P_PROX2, P_PROX3.
+
+    For each T in T_values, draws x^(0) from the flow (num_prox_steps=0),
+    then manually applies T gradient prox steps:
+        x^(t+1) = clamp(x^(t) - lam * At(Ax^(t) - y), 0, 1)
+
+    Residuals computed directly here — no dependency on PROX module.
+    NLL baseline is from T=0 only (flow NLL unchanged by post-hoc prox).
+
+    Args:
+        csmf_model  : CSMF model (eval mode set internally)
+        val_loader  : DataLoader yielding (x_clean, y_deg)
+        A_fn        : Forward operator callable: x (B,d) -> Ax (B,d')
+        At_fn       : Adjoint operator callable: r (B,d') -> Atr (B,d)
+        device      : Compute device
+        T_values    : List of T steps to evaluate. Default [0, 1, 2, 3].
+        lam         : Gradient step size (default 0.1)
+        max_batches : Max val batches to collect
+        num_samples : Samples per observation for std estimation
+
+    Returns:
+        Dict with keys:
+            "T_values"         : List[int]
+            "residuals_by_T"   : Dict[str, float]   — mean residual at each T
+            "residual_steps"   : List[float]         — per-step for max(T_values)
+            "sample_std_pre"   : float               — mean sample std at T=0
+            "sample_std_post"  : float               — mean sample std at T=max
+            "nll_baseline"     : float               — mean NLL at T=0
+        or None if no batches collected.
+    """
+    if T_values is None:
+        T_values = [0, 1, 2, 3]
+
+    T_max = max(T_values)
+    csmf_model.eval()
+
+    residuals_by_step: List[List[float]] = [[] for _ in range(T_max + 1)]
+    std_pre_all:  List[float] = []
+    std_post_all: List[float] = []
+    nll_all:      List[float] = []
+    n_collected = 0
+
+    for x_clean, y_deg in val_loader:
+        if n_collected >= max_batches:
+            break
+
+        y_deg   = y_deg.to(device)
+        x_clean = x_clean.to(device)
+
+        try:
+            x_samples, _ = csmf_model.sample(y_deg, num_samples=num_samples)
+            x_cur = x_samples.mean(dim=1)   # (B, d)
+
+            log_q, _ = csmf_model.forward(x_clean, y_deg)
+            if torch.isnan(log_q).any():
+                logger.warning(
+                    "MU | collect_prox_diagnostics: NaN NLL batch=%d — skipping",
+                    n_collected
+                )
+                continue
+            nll_all.append(-log_q.mean().item())
+
+            std_pre_all.append(x_samples.std(dim=1).mean().item())
+
+            y_flat = y_deg.flatten(1) if y_deg.dim() > 2 else y_deg
+
+            res_0 = (A_fn(x_cur) - y_flat).pow(2).mean().item()
+            if not np.isfinite(res_0):
+                logger.error(
+                    "MU | collect_prox_diagnostics: non-finite residual at t=0 "
+                    "batch=%d — skipping", n_collected
+                )
+                continue
+            residuals_by_step[0].append(res_0)
+
+            for t in range(T_max):
+                Ax    = A_fn(x_cur)
+                grad  = At_fn(Ax - y_flat)
+                x_cur = (x_cur - lam * grad).clamp(0.0, 1.0)
+                res_t = (A_fn(x_cur) - y_flat).pow(2).mean().item()
+                if not np.isfinite(res_t):
+                    logger.error(
+                        "MU | collect_prox_diagnostics: non-finite residual at "
+                        "t=%d batch=%d — stopping prox loop", t + 1, n_collected
+                    )
+                    break
+                residuals_by_step[t + 1].append(res_t)
+
+            x_post = x_samples.clone()
+            for s in range(num_samples):
+                xs = x_post[:, s, :]
+                for _ in range(T_max):
+                    xs = (xs - lam * At_fn(A_fn(xs) - y_flat)).clamp(0.0, 1.0)
+                x_post[:, s, :] = xs
+            std_post_all.append(x_post.std(dim=1).mean().item())
+
+            n_collected += 1
+
+        except Exception as e:
+            logger.error(
+                "MU | collect_prox_diagnostics: error batch=%d: %s",
+                n_collected, e
+            )
+            continue
+
+    if n_collected == 0:
+        logger.error("MU | collect_prox_diagnostics: no batches collected — returning None")
+        return None
+
+    mean_by_step = [
+        float(np.mean(residuals_by_step[t])) if residuals_by_step[t] else float("nan")
+        for t in range(T_max + 1)
+    ]
+    residuals_by_T = {
+        str(T): mean_by_step[T] if T <= T_max and np.isfinite(mean_by_step[T])
+                else float("nan")
+        for T in T_values
+    }
+
+    logger.info(
+        "MU | collect_prox_diagnostics: %d batches | T_max=%d | "
+        "residual T=0=%.6f -> T=%d=%.6f | NLL=%.4f",
+        n_collected, T_max,
+        mean_by_step[0], T_max, mean_by_step[T_max],
+        float(np.mean(nll_all)),
+    )
+
+    return {
+        "T_values":        T_values,
+        "residuals_by_T":  residuals_by_T,
+        "residual_steps":  mean_by_step,
+        "sample_std_pre":  float(np.mean(std_pre_all)),
+        "sample_std_post": float(np.mean(std_post_all)),
+        "nll_baseline":    float(np.mean(nll_all)),
+    }
+
+
+# =============================================================================
+# collect_mixture_recon_batch  [MIX-RECON] MU v1.6
+# =============================================================================
+
+def collect_mixture_recon_batch(
+    csmf_model,
+    val_loader,
+    device: torch.device,
+    n_samples: int = 8,
+) -> Optional[Dict[str, Any]]:
+    """
+    Collect Stage C mixture 4-col reconstruction data.
+
+    Cycle:     argmax-expert encode→decode from sample_all_experts().
+    Generated: gate-sampled generation from csmf_model.sample(y, num_samples=1).
+
+    Args:
+        csmf_model : CSMF model (eval mode set internally).
+        val_loader : DataLoader yielding (x_clean, y_deg).
+        device     : Compute device.
+        n_samples  : Number of samples to collect.
+
+    Returns:
+        Dict with keys:
+            "y"           : Tensor(n, 1, H, W) — degraded input
+            "x_clean"     : Tensor(n, 1, H, W) — clean ground truth
+            "x_cycle_mix" : Tensor(n, 1, H, W) — argmax-expert cycle recon
+            "x_gen_mix"   : Tensor(n, 1, H, W) or None — gate-sampled generation
+        or None on failure.
+    """
+    csmf_model.eval()
+
+    try:
+        x_clean_batch, y_deg_batch = next(iter(val_loader))
+    except StopIteration:
+        logger.error("MU | collect_mixture_recon_batch: val_loader is empty")
+        return None
+    except Exception as e:
+        logger.error("MU | collect_mixture_recon_batch: failed to get batch: %s", e)
+        return None
+
+    n = min(n_samples, x_clean_batch.shape[0])
+    x_clean = x_clean_batch[:n].to(device)
+    y_deg   = y_deg_batch[:n].to(device)
+
+    def _reshape(t: torch.Tensor) -> torch.Tensor:
+        """Reshape flat (B,784) → (B,1,28,28) if needed."""
+        if t.dim() == 2 and t.shape[-1] == 784:
+            return t.view(t.shape[0], 1, 28, 28)
+        return t
+
+    # ------------------------------------------------------------------
+    # Cycle: argmax-expert encode→decode via sample_all_experts()
+    # ------------------------------------------------------------------
+    x_cycle_mix = None
+    try:
+        with torch.no_grad():
+            w, x_hats = csmf_model.sample_all_experts(y_deg)  # (B,K), (B,K,d)
+
+        if torch.any(torch.isnan(w)):
+            logger.error("MU | collect_mixture_recon_batch: NaN in gate weights w")
+            return None
+
+        argmax_k = w.argmax(dim=1)  # (B,) expert index per sample
+
+        cycle_list = []
+        for i in range(n):
+            k_i  = argmax_k[i].item()
+            xhat = x_hats[i, k_i, :]   # (d,)
+            cycle_list.append(xhat.unsqueeze(0).cpu())
+
+        x_cycle_mix = _reshape(torch.cat(cycle_list, dim=0))  # (n, 1, 28, 28)
+
+        if torch.any(torch.isnan(x_cycle_mix)):
+            logger.error("MU | collect_mixture_recon_batch: NaN in x_cycle_mix")
+            return None
+
+        logger.info(
+            "MU | collect_mixture_recon_batch: cycle OK | "
+            "argmax experts=%s", argmax_k.cpu().tolist()
+        )
+
+    except Exception as e:
+        logger.error("MU | collect_mixture_recon_batch: cycle collection failed: %s", e)
+        return None
+
+    # ------------------------------------------------------------------
+    # Generated: gate-sampled generation via csmf_model.sample()
+    # ------------------------------------------------------------------
+    x_gen_mix = None
+    try:
+        with torch.no_grad():
+            x_gen_raw, _ = csmf_model.sample(y_deg, num_samples=1)
+            # sample() returns (B, num_samples, d) or (B, d) — normalise to (B, d)
+            if x_gen_raw.dim() == 3:
+                x_gen_raw = x_gen_raw[:, 0, :]   # take first sample
+
+        x_gen_mix = _reshape(x_gen_raw.cpu())  # (n, 1, 28, 28)
+
+        if torch.any(torch.isnan(x_gen_mix)):
+            logger.error("MU | collect_mixture_recon_batch: NaN in x_gen_mix")
+            x_gen_mix = None
+        else:
+            logger.info("MU | collect_mixture_recon_batch: generation OK")
+
+    except Exception as e:
+        logger.error(
+            "MU | collect_mixture_recon_batch: generation failed (non-fatal): %s", e
+        )
+        x_gen_mix = None   # non-fatal — cycle still usable
+
+    # Reshape x_clean and y_deg for consistent output format
+    x_clean_out = _reshape(x_clean.cpu())
+    y_out       = _reshape(y_deg.cpu())
+
+    return {
+        "y":           y_out,
+        "x_clean":     x_clean_out,
+        "x_cycle_mix": x_cycle_mix,
+        "x_gen_mix":   x_gen_mix,
+    }
+
+
+# =============================================================================
+# collect_fi_gate_comparison  [FI-GATE] MU v1.6
+# =============================================================================
+
+def collect_fi_gate_comparison(
+    csmf_model,
+    val_loader,
+    device: torch.device,
+    fi_summary_path: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load Stage A FI scores from fi_diag_summary.json and collect current
+    mean gate weights from val_loader for P_fi_gate comparison plot.
+
+    FI scores are computed on frozen Stage A weights and do not change during
+    Stage B — loading from JSON avoids recomputation.
+
+    Args:
+        csmf_model      : CSMF model in eval mode.
+        val_loader      : DataLoader yielding (x_clean, y_deg).
+        device          : Compute device.
+        fi_summary_path : Full path to fi_diag_summary.json from FI-DIAG run.
+
+    Returns:
+        Dict with keys:
+            "expert_names"     : List[str]
+            "fi_scores"        : List[float] — F_k mean per expert (Option A)
+            "fi_ratios"        : List[float] — F_k / max(F_k) per expert
+            "gate_weights_mean": List[float] — mean gate weight per expert on val
+        or None on failure (non-fatal — P_fi_gate must skip with warning).
+    """
+    # ------------------------------------------------------------------
+    # Step 1: Load FI summary JSON
+    # ------------------------------------------------------------------
+    if not fi_summary_path:
+        logger.warning(
+            "MU | collect_fi_gate_comparison: fi_summary_path not provided — "
+            "P_fi_gate will be skipped"
+        )
+        return None
+
+    try:
+        with open(fi_summary_path, "r") as f:
+            fi_data = json.load(f)
+    except FileNotFoundError:
+        logger.warning(
+            "MU | collect_fi_gate_comparison: fi_diag_summary.json not found "
+            "at '%s' — FI-DIAG may not have been run after Stage A. "
+            "P_fi_gate will be skipped (non-fatal).",
+            fi_summary_path,
+        )
+        return None
+    except Exception as e:
+        logger.error(
+            "MU | collect_fi_gate_comparison: failed to load '%s': %s — "
+            "P_fi_gate will be skipped",
+            fi_summary_path, e,
+        )
+        return None
+
+    # ------------------------------------------------------------------
+    # Step 2: Extract fi_mean and expert names from JSON
+    # Expected JSON structure: fi_data["option_a"][expert_name]["mean"]
+    # ------------------------------------------------------------------
+    try:
+        option_a = fi_data.get("option_a", {})
+        if not option_a:
+            logger.warning(
+                "MU | collect_fi_gate_comparison: 'option_a' key missing or empty "
+                "in fi_diag_summary.json — P_fi_gate will be skipped"
+            )
+            return None
+
+        expert_names_fi = list(option_a.keys())
+        fi_scores = [float(option_a[name].get("mean", 0.0)) for name in expert_names_fi]
+        fi_max    = max(fi_scores) if fi_scores else 1.0
+        fi_ratios = [s / max(fi_max, 1e-8) for s in fi_scores]
+
+        logger.info(
+            "MU | collect_fi_gate_comparison: loaded FI for %d experts: %s",
+            len(expert_names_fi),
+            {n: f"{s:.4f}" for n, s in zip(expert_names_fi, fi_scores)},
+        )
+
+    except Exception as e:
+        logger.error(
+            "MU | collect_fi_gate_comparison: failed to parse option_a from JSON: %s — "
+            "P_fi_gate will be skipped", e
+        )
+        return None
+
+    # ------------------------------------------------------------------
+    # Step 3: Collect mean gate weights from val_loader
+    # ------------------------------------------------------------------
+    csmf_model.eval()
+    gate_weight_acc = None
+    n_batches = 0
+
+    try:
+        with torch.no_grad():
+            for x_clean, y_deg in val_loader:
+                y_deg = y_deg.to(device)
+                try:
+                    w = csmf_model._gate_weights(y_deg)   # (B, K)
+                    if torch.any(torch.isnan(w)):
+                        logger.warning(
+                            "MU | collect_fi_gate_comparison: NaN gate weights "
+                            "batch=%d — skipping", n_batches
+                        )
+                        continue
+                    acc = w.mean(dim=0).cpu()              # (K,)
+                    gate_weight_acc = acc if gate_weight_acc is None \
+                                      else gate_weight_acc + acc
+                    n_batches += 1
+                except Exception as e:
+                    logger.error(
+                        "MU | collect_fi_gate_comparison: gate forward failed "
+                        "batch=%d: %s", n_batches, e
+                    )
+                    continue
+
+    except Exception as e:
+        logger.error(
+            "MU | collect_fi_gate_comparison: val_loader iteration failed: %s", e
+        )
+        return None
+
+    if n_batches == 0 or gate_weight_acc is None:
+        logger.error(
+            "MU | collect_fi_gate_comparison: no valid batches for gate weights — "
+            "P_fi_gate will be skipped"
+        )
+        return None
+
+    gate_weights_mean = (gate_weight_acc / n_batches).tolist()   # (K,)
+
+    # ------------------------------------------------------------------
+    # Step 4: Align expert ordering (FI JSON vs model expert list)
+    # JSON expert names may differ from model class names — match by
+    # stripping "Conditional" prefix for robust comparison.
+    # ------------------------------------------------------------------
+    model_expert_names = [type(e).__name__ for e in csmf_model.experts]
+
+    def _short(name: str) -> str:
+        return name.replace("Conditional", "").lower()
+
+    aligned_fi     = []
+    aligned_ratios = []
+    aligned_gates  = []
+    aligned_names  = []
+
+    for k, model_name in enumerate(model_expert_names):
+        short_model = _short(model_name)
+        matched_fi  = None
+        matched_ratio = None
+
+        for fi_name, fi_val, fi_ratio in zip(expert_names_fi, fi_scores, fi_ratios):
+            if _short(fi_name) == short_model:
+                matched_fi    = fi_val
+                matched_ratio = fi_ratio
+                break
+
+        if matched_fi is None:
+            logger.warning(
+                "MU | collect_fi_gate_comparison: expert '%s' not found in "
+                "fi_diag_summary.json — using fi=0.0 for this expert",
+                model_name,
+            )
+            matched_fi    = 0.0
+            matched_ratio = 0.0
+
+        gate_w = gate_weights_mean[k] if k < len(gate_weights_mean) else 0.0
+        aligned_fi.append(matched_fi)
+        aligned_ratios.append(matched_ratio)
+        aligned_gates.append(gate_w)
+        aligned_names.append(model_name)
+
+    # Flag misalignment: high FI but low gate weight
+    for name, fi_r, gw in zip(aligned_names, aligned_ratios, aligned_gates):
+        if fi_r > 0.5 and gw < 0.1:
+            logger.warning(
+                "MU | collect_fi_gate_comparison: MISALIGNMENT — expert '%s' has "
+                "high FI ratio=%.3f but low gate weight=%.3f. "
+                "Gate may not be routing to this expert.",
+                name, fi_r, gw,
+            )
+
+    logger.info(
+        "MU | collect_fi_gate_comparison: complete | %d experts | "
+        "gate_weights=%s | fi_ratios=%s",
+        len(aligned_names),
+        [f"{g:.3f}" for g in aligned_gates],
+        [f"{r:.3f}" for r in aligned_ratios],
+    )
+
+    return {
+        "expert_names":      aligned_names,
+        "fi_scores":         aligned_fi,
+        "fi_ratios":         aligned_ratios,
+        "gate_weights_mean": aligned_gates,
     }

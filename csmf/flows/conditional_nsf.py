@@ -1,7 +1,12 @@
-# Version: WP0.3-CondNSF-v2.4
+# Version: WP0.3-CondNSF-v2.5
 # Abbr: COND-NSF
-# Last Modified: 2026-04-06
+# Last Modified: 2026-04-17
 # Changelog:
+#   v2.5 (2026-04-17): [NSF-CLAMP] Tighten NSFFiLM: scale_factor 0.1→0.05,
+#                      residual_alpha 0.03→0.01, modulated clamp ±100→±5,
+#                      output clamp ±50→±3; tighten post-film1/film2 clamps
+#                      in _compute_params ±50→±3; previous ±50 too wide to
+#                      catch NaN from inside FiLM MLP weights even at LR=5e-5
 #   v2.4 (2026-04-06): [F] Clamp inp after cat and fc1 output before activation —
 #                      cond_half can be large even after h clamp; joint inp clamp
 #                      (-10,10) stops explosion entering fc1; fc1 output clamp (-20,20)
@@ -88,8 +93,8 @@ class NSFFiLM(nn.Module):
     FiLM behaviour for RealNVP/NICE or other flows.
     """
 
-    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=0.1,
-                 residual_alpha=0.03, debug=False):
+    def __init__(self, f_dim, h_dim, hidden_dims=[128, 128], scale_factor=0.05,
+                 residual_alpha=0.01, debug=False):
         super().__init__()
         self.base = FiLM(
             f_dim=f_dim,
@@ -103,11 +108,11 @@ class NSFFiLM(nn.Module):
     def forward(self, f, h):
         f = f.clamp(-20.0, 20.0)
         modulated = self.base(f, h)
-        # v2.0: clamp modulated BEFORE residual blend — catches overflow from
-        # inside FiLM MLP weights; primary fix is gamma/beta clamp in film.py
-        modulated = modulated.clamp(-100.0, 100.0)
+        # [NSF-CLAMP] v2.5: tighten ±100→±5 — FiLM MLP can produce large values
+        # even with small scale_factor; ±5 matches h clamp scale (v2.3)
+        modulated = modulated.clamp(-5.0, 5.0)
         out = f + self.residual_alpha * (modulated - f)
-        return out.clamp(-50.0, 50.0)
+        return out.clamp(-3.0, 3.0)   # [NSF-CLAMP] v2.5: tighten ±50→±3
 
 
 class RationalQuadraticSpline:
@@ -288,7 +293,7 @@ class ConditionalRQSplineCoupling(nn.Module):
         out = self.act(out)
         out = out.clamp(-50.0, 50.0)
         out = self.film1(out, h)
-        out = out.clamp(-50.0, 50.0)   # v2.0: downstream safeguard after film1
+        out = out.clamp(-3.0, 3.0)   # [NSF-CLAMP] v2.5: tighten ±50→±3
         if not torch.isfinite(out).all():
             logger.error("[COND-NSF] NaN/Inf after film1 in _compute_params")
             raise RuntimeError("NaN/Inf after film1 in _compute_params")
@@ -298,7 +303,7 @@ class ConditionalRQSplineCoupling(nn.Module):
         out = self.act(out)
         out = out.clamp(-50.0, 50.0)
         out = self.film2(out, h)
-        out = out.clamp(-50.0, 50.0)   # v2.0: downstream safeguard after film2
+        out = out.clamp(-3.0, 3.0)   # [NSF-CLAMP] v2.5: tighten ±50→±3
         if not torch.isfinite(out).all():
             logger.error("[COND-NSF] NaN/Inf after film2 in _compute_params")
             raise RuntimeError("NaN/Inf after film2 in _compute_params")

@@ -43,3 +43,23 @@ checkpoints/
 
 # data
 data/
+
+# logs folders anywhere
+**/logs/
+
+# any directory with "results" in its name
+**/*results*/
+
+# any file with these keywords in its name
+*BACKUP*
+*CODEBASE*
+*DEPRECATED*
+
+# ignore all PNG images
+*.png
+
+# ignore all PTH files
+*.pth
+
+# ignore all JSON files
+*.json
